@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Big Apple Taxi Receipt</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Arial:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        /* General Body Styles */
+        body {
+            font-family: 'Arial', sans-serif;
+            background-color: #f0f0f0;
+            color: #000;
+            margin: 0;
+            padding: 20px;
+            font-size: 10px;
+        }
+
+        .receipt-container {
+            max-width: 800px;
+            margin: auto;
+            background-color: #fff;
+            padding: 20px;
+            border: 1px solid #ccc;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+        }
+
+        /* Header Styles */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            border-bottom: 2px solid #000;
+            padding-bottom: 10px;
+            margin-bottom: 10px;
+        }
+
+        header .logo {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 14px;
+            gap: 5px;
+        }
+
+        header .logo svg {
+            margin-right: 8px;
+        }
+
+        header .company-info {
+            text-align: right;
+        }
+
+        header .company-info p {
+            margin: 2px 0;
+        }
+
+        /* Top Info Block */
+        .info-block {
+            display: flex;
+            background-color: #e0f7fa;
+            border: 1px solid #4dd0e1;
+            margin-bottom: 15px;
+        }
+
+        .info-block > div {
+            width: 50%;
+            padding: 10px;
+        }
+
+        .info-block p {
+            margin: 5px 0;
+        }
+
+        /* Confirmation Line */
+        .confirmation-line {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            padding: 10px;
+            border: 1px solid #ccc;
+            margin-bottom: 15px;
+        }
+        .confirmation-line p {
+            margin: 0;
+        }
+        .signature-line {
+            border-bottom: 1.5px solid black;
+            width: 250px;
+            text-align: center;
+            font-weight: bold;
+            padding-bottom: 2px;
+        }
+
+
+        /* Financial Summary Grid */
+        .financial-summary {
+            display: flex;
+            flex-wrap: wrap;
+            border: 1px solid #000;
+            margin-bottom: 15px;
+        }
+
+        .summary-box {
+            border-right: 1px solid #000;
+            border-bottom: 1px solid #000;
+            padding: 8px;
+            text-align: center;
+            flex-grow: 1;
+        }
+
+        .summary-box span {
+            display: block;
+            font-size: 9px;
+            margin-bottom: 4px;
+        }
+
+        .summary-box strong {
+            font-size: 14px;
+        }
+
+        .summary-box.date-range {
+            flex-basis: 100%;
+            border-right: none;
+            border-bottom: none;
+        }
+
+        /* To match the layout of 6 boxes then one wide one */
+        .financial-summary .summary-box:nth-child(6) { border-right: none; }
+        .financial-summary .summary-box:nth-child(7) { border-top: 1px solid #000; }
+
+
+        /* Trip Log Table */
+        .trip-log {
+            margin-bottom: 15px;
+        }
+
+        .trip-log table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 10px;
+        }
+
+        .trip-log th, .trip-log td {
+            border: 1px solid #ccc;
+            padding: 5px;
+            text-align: center;
+        }
+
+        .trip-log th {
+            background-color: #f2f2f2;
+            font-weight: bold;
+        }
+        /* Add vertical borders between columns */
+        .trip-log td:nth-child(4), .trip-log th:nth-child(4),
+        .trip-log td:nth-child(8), .trip-log th:nth-child(8) {
+            border-right: 2px solid #999;
+        }
+
+
+        .credit-card-summary {
+            border: 1px solid #ccc;
+            border-top: none;
+            padding: 8px;
+            text-align: center;
+            font-weight: bold;
+        }
+
+        .credit-card-summary p {
+            margin: 0;
+        }
+
+        /* Bottom Info Boxes */
+        .info-box {
+            margin-top: 15px;
+            padding: 10px 15px;
+            border: 1.5px solid;
+            border-radius: 5px;
+        }
+
+        .info-box h4 {
+            margin-top: 0;
+            margin-bottom: 10px;
+        }
+
+        .info-box p, .info-box ul {
+            margin: 0;
+            padding-left: 20px; /* For ul */
+            font-size: 9px;
+            line-height: 1.6;
+        }
+        .info-box p {
+            padding-left: 0;
+        }
+
+        .info-box li {
+            margin-bottom: 5px;
+        }
+
+        /* Specific Box Colors */
+        .lease-box {
+            background-color: #f3e5f5;
+            border-color: #ce93d8;
+        }
+
+        .notes-box {
+            background-color: #fff3e0;
+            border-color: #ffcc80;
+        }
+
+        .attention-box {
+            background-color: #e8f5e9;
+            border-color: #a5d6a7;
+        }
+
+        /* Print-specific styles */
+        @media print {
+            body {
+                background-color: #fff;
+                padding: 0;
+                font-size: 9pt;
+            }
+            .receipt-container {
+                box-shadow: none;
+                border: none;
+                max-width: 100%;
+            }
+            .info-box, .info-block {
+              /* Ensures background colors are printed */
+              -webkit-print-color-adjust: exact; 
+              print-color-adjust: exact;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="receipt-container">
+        <!-- Header -->
+        <header>
+            <div class="logo">
+               <img src="./Group 48099891.svg" alt="">
+                <span>BIG APPLE TAXI</span>
+            </div>
+            <div class="company-info">
+                <p>Printed: {{generated_at}}</p>
+                <p><strong>Big Apple Taxi Management LLC</strong></p>
+                <p>54-11 Queens Boulevard</p>
+                <p>Woodside, NY 11377</p>
+                <p>(718) 779-5000</p>
+            </div>
+        </header>
+
+        <!-- Driver & Payment Info -->
+        <section class="info-block">
+            <div class="driver-details">
+                <p><strong>Medallion :</strong> {{medallion.medallion_number}}</p>
+                <p><strong>Driver :</strong> {{driver.first_name}} {{driver.last_name}}</p>
+                <p><strong>Hack Number :</strong>{{receipt.receipt_number}}</p>
+            </div>
+            <div class="payment-details">
+                <p><strong>Payment Received :</strong>{{generated_at}}</p>
+                <p><strong>Payment Due Date :</strong>{{payment_due_date}}</p>
+                <p><strong>Payment Status :</strong>{{due_num_days}}</p>
+            </div>
+        </section>
+
+        <!-- Check Confirmation -->
+        <section class="confirmation-line">
+            <p>I, {{driver.first_name}} {{driver.last_name}} have received a check in the amount of <strong>{{receipt.balance}}</strong></p>
+            <span class="signature-line">X</span>
+        </section>
+
+        <!-- Financial Summary -->
+        <section class="financial-summary">
+            <div class="summary-box"><span>Total Receipts</span><strong>{{receipt.balance}}</strong></div>
+            <div class="summary-box"><span>Transaction Fee</span><strong>$0.00</strong></div>
+            <div class="summary-box"><span>Funds Available</span><strong>$0.00</strong></div>
+            <div class="summary-box"><span>MTA/TIF/CPS/AAF</span><strong>$0.00</strong></div>
+            <div class="summary-box"><span>Funds Applied</span><strong>$0.00</strong></div>
+            <div class="summary-box"><span>Funds Returned</span><strong>$0.00</strong></div>
+            <div class="summary-box date-range"><span>Date Range</span><strong>{{receipt.period_start}} - {{receipt.period_end}}</strong></div>
+        </section>
+
+        <!-- Trip Log -->
+        <section class="trip-log">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Trip Date</th><th>Hack</th><th>Trip ID</th><th>Receipt</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <!-- This is a sample row. The actual document would have many of these. -->
+
+                    {% for trip in trips %}
+                    <tr>
+                        <td>{{trip.start_date}}</td>
+                        <td>{{trip.record_id}}</td>
+                        <td>{{trip.record_id}}</td>
+                        <td>{{trip.total_amount}}</td>
+                    </tr>
+                    {% endfor %}
+                     
+                </tbody>
+            </table>
+            <div class="credit-card-summary">
+                <p>Credit Card Receipts: ${{receipt.balance}} – 0 MTA: $0.00 - 0 TIF: $0.00 - 0 Congestion: $0.00 - 0 Airport: $0.00 = <strong>${{receipt.balance}}</strong></p>
+            </div>
+        </section>
+        
+        <!-- Lease Payment -->
+        <section class="info-box lease-box">
+            <h4>Lease Payment ${{lease_amount}} Calculated as:</h4>
+            <p>
+                Credit Card Fee TLC Rule 58-21(c)(5)(xi): $49.00 + Medallion Lease: $530.99 + Medallion Renewal: $10.58 + DMV Insp.: $0.71 + Registration: $1.09 + TLC Insp.: $3.46 + Tax Stamp: $7.58 + Sales Tax: $91.40 + Vehicle Lease: $205.00
+            </p>
+        </section>
+
+        <!-- Notes -->
+        <section class="info-box notes-box">
+            <h4>Notes</h4>
+            <ul>
+                <li>DRIVER'S WEEKLY LEASE PAYMENT (PRINCIPAL) IS INCLUSIVE OF THE $49 (DOV) or $49 (WEEKLY) CREDIT CARD PROCESSING SURCHARGE-TLC RULE 58-21</li>
+                <li>DRIVERS ARE NOT ALLOWED TO TRANSFER THEIR VEHICLES DURING THE FIRST SIX MONTHS OF THEIR CONTRACT AND DURING THE SIX MONTHS PRIOR TO VEHICLE RETIREMENT</li>
+            </ul>
+        </section>
+
+        <!-- Attention -->
+        <section class="info-box attention-box">
+            <h4>Attention! Vehicle service shop is moving to 62-10 34th Ave on Monday, 3/11/2024.</h4>
+            <ul>
+                <li>You Cannot Refuse To Accept A Passenger Nor Can You Use A Cell Phone While Driving Meter Tampering Is Illegal</li>
+                <li>No Other Person Other Than The Authorized Driver May Drive The Vehicle</li>
+            </ul>
+        </section>
+    </div>
+</body>
+</html>

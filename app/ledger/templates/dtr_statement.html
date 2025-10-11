@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Medallion Statement - {{ data.medallion.medallion_number }}</title>
+    <style>
+        @page {
+            size: letter;
+            margin: 0.5in;
+        }
+        body {
+            font-family: Arial, sans-serif;
+            font-size: 10px;
+            color: #333;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            border-bottom: 2px solid #000;
+            padding-bottom: 10px;
+            margin-bottom: 15px;
+        }
+        .header .logo-section {
+            display: flex;
+            align-items: center;
+        }
+        .header .logo {
+            width: 60px;
+            height: auto;
+            margin-right: 10px;
+        }
+        .header .company-info {
+            font-weight: bold;
+        }
+        .header .statement-info {
+            text-align: right;
+        }
+        .statement-main-header {
+            text-align: center;
+            font-size: 14px;
+            font-weight: bold;
+            border-top: 1px solid #000;
+            border-bottom: 1px solid #000;
+            padding: 5px 0;
+            margin-bottom: 15px;
+        }
+        .content-grid {
+            display: flex;
+            justify-content: space-between;
+            width: 100%;
+            gap: 20px;
+        }
+        .left-column, .right-column {
+            width: 48%;
+        }
+        .full-width-column {
+            width: 100%;
+        }
+        .info-box {
+            border: 1px solid #ccc;
+            padding: 10px;
+            margin-bottom: 15px;
+        }
+        .info-box h3 {
+            margin: 0 0 10px 0;
+            font-size: 12px;
+            border-bottom: 1px solid #ccc;
+            padding-bottom: 5px;
+        }
+        .account-balance-table, .details-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .account-balance-table th, .account-balance-table td,
+        .details-table th, .details-table td {
+            padding: 5px;
+            text-align: left;
+            border: 1px solid #ddd;
+        }
+        .account-balance-table .label {
+            font-weight: bold;
+        }
+        .account-balance-table .amount {
+            text-align: right;
+        }
+        .total-due-row, .payment-row {
+            background-color: #dff0d8;
+            font-weight: bold;
+        }
+        .balance-row {
+            font-weight: bold;
+        }
+        .details-table th {
+            background-color: #f2f2f2;
+            font-weight: bold;
+        }
+        .details-table td {
+            text-align: right;
+        }
+        .details-table .text-left {
+            text-align: left;
+        }
+        .footer-note {
+            font-style: italic;
+            margin-top: 15px;
+            border: 1px solid #ccc;
+            padding: 10px;
+            font-size: 9px;
+        }
+        .page-break {
+            page-break-before: always;
+        }
+    </style>
+</head>
+<body>
+    <!-- ================================================================== -->
+    <!--                       PAGE 1: MEDALLION STATEMENT                      -->
+    <!-- ================================================================== -->
+    <div class="header">
+        <div class="logo-section">
+            <!-- Replace with your actual logo path or a Base64 encoded image -->
+            <!-- <img src="logo.png" alt="Big Apple Taxi" class="logo"> -->
+            <div class="company-info">
+                Big Apple Taxi Management LLC<br>
+                50-24 Queens Blvd<br>
+                Woodside NY 11377
+            </div>
+        </div>
+        <div class="statement-info">
+            <strong>Medallion {{ data.medallion.medallion_number }}</strong><br>
+            {{ data.period_start.strftime('%m/%d/%Y') }} {{ data.period_end.strftime('%m/%d/%Y') }}<br>
+            Statement Date: {{ generated_at.strftime('%m/%d/%Y') }}<br>
+            Statement#: {{ data.receipt.receipt_number }}
+        </div>
+    </div>
+
+    <div class="statement-main-header">Medallion Statement</div>
+
+    <div class="content-grid">
+        <div class="left-column">
+            <div class="info-box">
+                <h3>{{ data.medallion.medallion_number }}</h3>
+                <p>
+                    {{ data.driver.full_name }} - {{ data.driver.tlc_license.tlc_license_number if data.driver.tlc_license else 'N/A' }}<br>
+                    CONTRACT PERIOD: {{ data.lease.lease_start_date.strftime('%m/%d/%Y') if data.lease else 'N/A' }} {{ data.lease.lease_end_date.strftime('%m/%d/%Y') if data.lease else 'N/A' }}
+                </p>
+            </div>
+             <div class="info-box">
+                <h3>Account Balance</h3>
+                <table class="account-balance-table">
+                    <tr>
+                        <td class="label">Previous Balance</td>
+                        <td class="amount">{{ "%.2f"|format(data.account_balance.previous_balance) }}</td>
+                    </tr>
+                    <tr>
+                        <td class="label">CC EARNINGS</td>
+                        <td class="amount">{{ "%.2f"|format(data.account_balance.cc_earnings) }}</td>
+                    </tr>
+                    <tr>
+                        <td class="label">MTA, IMP, CONG, CBDT & AIR FEE</td>
+                        <td class="amount">({{ "%.2f"|format(data.account_balance.total_surcharges) }})</td>
+                    </tr>
+                    <tr>
+                        <td class="label">EZPASS TOLLS</td>
+                        <td class="amount">({{ "%.2f"|format(data.account_balance.ezpass_tolls) }})</td>
+                    </tr>
+                    <tr>
+                        <td class="label">TICKETS</td>
+                        <td class="amount">({{ "%.2f"|format(data.account_balance.tickets) }})</td>
+                    </tr>
+                    <tr>
+                        <td class="label">LEASING CHARGES</td>
+                        <td class="amount">({{ "%.2f"|format(data.account_balance.leasing_charges) }})</td>
+                    </tr>
+                    <tr class="total-due-row">
+                        <td class="label">Total Due</td>
+                        <td class="amount">({{ "%.2f"|format(data.account_balance.total_due) }})</td>
+                    </tr>
+                    <tr class="payment-row">
+                        <td class="label">Payment</td>
+                        <td class="amount">({{ "%.2f"|format(data.account_balance.total_due) }})</td>
+                    </tr>
+                    <tr class="balance-row">
+                        <td class="label">Balance</td>
+                        <td class="amount">{{ "%.2f"|format(data.account_balance.balance) }}</td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+        <div class="right-column">
+             <div class="info-box">
+                <h3>Customer Service Information</h3>
+                <p>
+                    Office (718)-779-5000<br>
+                    Text<br>
+                    <b>Call or Text Us!</b>
+                </p>
+            </div>
+            <div class="info-box">
+                <h3>Alerts</h3>
+                <p>DMV Inspection Due<br>{{ data.vehicle.registrations[0].registration_expiry_date.strftime('%m/%d/%Y') if data.vehicle.registrations else 'N/A' }}</p>
+                <p>TLC Inspection Due<br>{{ data.vehicle.inspections[0].next_inspection_due_date.strftime('%m/%d/%Y') if data.vehicle.inspections else 'N/A' }}</p>
+                <p>MILERUN Due<br>01/29/2026</p> <!-- Placeholder, add logic if available -->
+            </div>
+        </div>
+    </div>
+    
+    <div class="full-width-column">
+        <div class="info-box">
+            <h3>Payment Detail</h3>
+            <table class="details-table">
+                <thead>
+                    <tr>
+                        <th class="text-left">PAY TYPE</th>
+                        <th>AMOUNT</th>
+                        <th>CHECK#</th>
+                        <th>ACH BATCH</th>
+                        <th>DATE</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td class="text-left">DIRECT DEPOSIT</td>
+                        <td>({{ "%.2f"|format(data.account_balance.payment) }})</td>
+                        <td></td>
+                        <td>101</td> <!-- Placeholder -->
+                        <td></td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="info-box">
+            <h3>Driver Contact Information</h3>
+            <table class="details-table">
+                 <thead>
+                    <tr>
+                        <th class="text-left">DR LIC.</th>
+                        <th class="text-left">DRIVER NAME</th>
+                        <th class="text-left">CELL PHONE</th>
+                        <th class="text-left">EMAIL</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td class="text-left">{{ data.driver.dmv_license.dmv_license_number if data.driver.dmv_license else 'N/A' }}</td>
+                        <td class="text-left">{{ data.driver.full_name }}</td>
+                        <td class="text-left">{{ data.driver.phone_number_1 }}</td>
+                        <td class="text-left">{{ data.driver.email_address }}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        <div class="footer-note">
+            *EZPASS TOLLS & TICKETS INCLUDE TRANSACTIONS WHERE DRIVER IS "UNKNOWN" (NO DRIVER ON SHIFT).
+        </div>
+    </div>
+
+    <!-- ================================================================== -->
+    <!--                         PAGE 2: DETAILS                            -->
+    <!-- ================================================================== -->
+    <div class="page-break"></div>
+    <div class="header">
+        <div class="logo-section">
+            <div class="company-info">
+                Big Apple Taxi Management LLC<br>
+                50-24 Queens Blvd<br>
+                Woodside NY 11377
+            </div>
+        </div>
+        <div class="statement-info">
+            <strong>Medallion {{ data.medallion.medallion_number }}</strong><br>
+            {{ data.period_start.strftime('%m/%d/%Y') }} {{ data.period_end.strftime('%m/%d/%Y') }}<br>
+            Statement Date: {{ generated_at.strftime('%m/%d/%Y') }}<br>
+            Statement#: {{ data.receipt.receipt_number }}
+        </div>
+    </div>
+
+    <div class="info-box">
+        <h3>TAXES & Surcharges Detail</h3>
+        <table class="details-table">
+            <thead>
+                <tr>
+                    <th class="text-left">TYPE_CHARGE</th>
+                    <th>{{ data.driver.full_name }}-{{ data.driver.tlc_license.tlc_license_number if data.driver.tlc_license else '' }}</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr><td class="text-left">AIRPORT FEE</td><td>{{ "%.2f"|format(data.surcharges_detail.airport_fee) }}</td></tr>
+                <tr><td class="text-left">CBDT</td><td>{{ "%.2f"|format(data.surcharges_detail.cbdt) }}</td></tr>
+                <tr><td class="text-left">CONGESTION SURCHA</td><td>{{ "%.2f"|format(data.surcharges_detail.cong_surcharge) }}</td></tr>
+                <tr><td class="text-left">MTA TAX</td><td>{{ "%.2f"|format(data.surcharges_detail.mta_tax) }}</td></tr>
+                <tr><td class="text-left">Taxicab Improvement Su</td><td>{{ "%.2f"|format(data.surcharges_detail.imp_surcharge) }}</td></tr>
+                <tr><td class="text-left"><b>Total</b></td><td><b>${{ "%.2f"|format(data.account_balance.total_surcharges) }}</b></td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="info-box">
+        <h3>Leasing Charges & TLC Fees Detail</h3>
+        <table class="details-table">
+             <thead>
+                <tr>
+                    <th class="text-left">Item</th>
+                    <th class="text-left">Description</th>
+                    <th>Contract Rate</th>
+                    <th class="text-left">TLC Regulation</th>
+                </tr>
+            </thead>
+             <tbody>
+                <tr>
+                    <td class="text-left">LEASE 58-21c1or2</td>
+                    <td class="text-left"></td>
+                    <td>({{ "%.2f"|format(data.account_balance.leasing_charges) }})</td>
+                    <td class="text-left"></td>
+                </tr>
+                <tr>
+                    <td class="text-left"><b>Total</b></td>
+                    <td></td>
+                    <td><b>({{ "%.2f"|format(data.account_balance.leasing_charges) }})</b></td>
+                    <td></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+    
+    <div class="info-box">
+        <h3>EZPASS Tolls Detail</h3>
+        <table class="details-table">
+            <thead>
+                <tr>
+                    <th class="text-left">Transaction Date</th>
+                    <th class="text-left">Driver Hack Lic.</th>
+                    <th class="text-left">TAG</th>
+                    <th class="text-left">Exit Lane</th>
+                    <th>Toll</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for toll in data.ezpass_details %}
+                <tr>
+                    <td class="text-left">{{ toll.transaction_date.strftime('%m/%d/%Y') }} {{ toll.transaction_time.strftime('%I:%M %p') }}</td>
+                    <td class="text-left">{{ data.driver.tlc_license.tlc_license_number if data.driver.tlc_license else 'N/A' }}</td>
+                    <td class="text-left">{{ toll.tag_or_plate }}</td>
+                    <td class="text-left">{{ toll.exit_plaza }}</td>
+                    <td>{{ "%.2f"|format(toll.amount) }}</td>
+                </tr>
+                {% endfor %}
+                <tr>
+                    <td class="text-left"><b>Total</b></td>
+                    <td colspan="3"></td>
+                    <td><b>{{ "%.2f"|format(data.account_balance.ezpass_tolls) }}</b></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="info-box">
+        <h3>Tickets Detail</h3>
+        <table class="details-table">
+            <thead>
+                <tr>
+                    <th class="text-left">DATE TIME</th>
+                    <th class="text-left">TICKET #</th>
+                    <th class="text-left">DRIVER LIC.</th>
+                    <th class="text-left">NOTE</th>
+                    <th>AMOUNT</th>
+                    <th>COM.</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for ticket in data.tickets_details %}
+                <tr>
+                    <td class="text-left">{{ ticket.issue_date.strftime('%m/%d/%Y') }} {{ ticket.issue_time }}</td>
+                    <td class="text-left">{{ ticket.summons_number }}</td>
+                    <td class="text-left">{{ data.driver.tlc_license.tlc_license_number if data.driver.tlc_license else 'UNKNOWN' }}</td>
+                    <td class="text-left"> <!-- Placeholder for Note --> </td>
+                    <td>{{ "%.2f"|format(ticket.amount_due) }}</td>
+                    <td>$0.00</td> <!-- Placeholder for COM -->
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    
+
+    <!-- ================================================================== -->
+    <!--                      PAGE 3: DRIVER STATEMENT                      -->
+    <!-- ================================================================== -->
+    <div class="page-break"></div>
+    <div class="header">
+        <div class="logo-section">
+            <div class="company-info">
+                Big Apple Taxi Management LLC<br>
+                50-24 Queens Blvd<br>
+                Woodside NY 11377
+            </div>
+        </div>
+        <div class="statement-info">
+            <strong>Medallion {{ data.medallion.medallion_number }}</strong><br>
+            Statement Date: {{ generated_at.strftime('%m/%d/%Y') }}<br>
+            Statement#: {{ data.receipt.receipt_number }}
+        </div>
+    </div>
+    
+    <div class="statement-main-header">Driver Statement</div>
+
+    <div class="info-box">
+        <h3>Driver Earning</h3>
+        <table class="account-balance-table">
+            <tr>
+                <td class="label">CC Earning</td>
+                <td class="amount">{{ "%.2f"|format(data.account_balance.cc_earnings) }}</td>
+            </tr>
+            <tr><td class="label">MTA Tax</td><td class="amount">({{ "%.2f"|format(data.surcharges_detail.mta_tax) }})</td></tr>
+            <tr><td class="label">CONG Surcharge</td><td class="amount">({{ "%.2f"|format(data.surcharges_detail.cong_surcharge) }})</td></tr>
+            <tr><td class="label">IMP Surcharge</td><td class="amount">({{ "%.2f"|format(data.surcharges_detail.imp_surcharge) }})</td></tr>
+            <tr><td class="label">Airport Fee</td><td class="amount">({{ "%.2f"|format(data.surcharges_detail.airport_fee) }})</td></tr>
+            <tr><td class="label">CBDT</td><td class="amount">({{ "%.2f"|format(data.surcharges_detail.cbdt) }})</td></tr>
+            <tr><td class="label">EZ-PASS Toll</td><td class="amount">({{ "%.2f"|format(data.account_balance.ezpass_tolls) }})</td></tr>
+            <tr><td class="label">Tickets</td><td class="amount">({{ "%.2f"|format(data.account_balance.tickets) }})</td></tr>
+            <tr class="balance-row">
+                <td class="label">NET Earning</td>
+                <td class="amount">{{ "%.2f"|format(data.account_balance.cc_earnings - data.account_balance.total_surcharges - data.account_balance.ezpass_tolls - data.account_balance.tickets) }}</td>
+            </tr>
+        </table>
+    </div>
+
+     <div class="info-box">
+        <h3>Credit Card Detail</h3>
+        <table class="details-table">
+            <thead>
+                <tr>
+                    <th class="text-left">DROP TIME</th>
+                    <th class="text-left">TRIP NUM</th>
+                    <th>AMOUNT</th>
+                    <th class="text-left">NOTE</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for trip in data.curb_trips %}
+                <tr>
+                    <td class="text-left">{{ trip.start_date.strftime('%m/%d/%Y') }} {{ trip.start_time.strftime('%I:%M %p') }}</td>
+                    <td class="text-left">{{ trip.trip_number }}</td>
+                    <td>${{ "%.2f"|format(trip.total_amount) }}</td>
+                    <td class="text-left"></td>
+                </tr>
+                {% endfor %}
+                 <tr class="balance-row">
+                    <td class="text-left" colspan="2"><b>TOTAL:</b></td>
+                    <td><b>${{ "%.2f"|format(data.account_balance.cc_earnings) }}</b></td>
+                    <td></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+</body>
+</html>
