@@ -1,395 +1,708 @@
-### app/ezpass/services.py
+# app/ezpass/services.py
 
-# Standard library imports
-from typing import Union, Optional, List
-from datetime import datetime, timezone
+"""
+Enhanced business logic layer for EZPass operations with complete association and posting logic.
+"""
 
-# Third party imports
-from sqlalchemy.orm import Session
-from sqlalchemy import desc, asc, or_
+from datetime import datetime, timezone, date
+from typing import List, Tuple, Optional, Dict, Any
 
-# Local imports
+from fastapi import Depends
+from sqlalchemy import select, and_, or_
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from app.core.db import get_async_db
+from app.ezpass.repository import EZPassRepository
+from app.ezpass.schemas import (
+    EZPassTransactionCreate, EZPassTransactionUpdate, EZPassTransactionFilters,
+    EZPassLogCreate, EZPassLogFilters, EZPassImportResult,
+    EZPassAssociationResult, EZPassPostingResult,
+)
+from app.ezpass.models import EZPassTransaction, EZPassLog
+from app.ezpass.exceptions import (
+    EZPassTransactionNotFoundException, EZPassLogNotFoundException,
+    EZPassImportException, EZPassAssociationException, EZPassPostingException,
+    EZPassUpdateException,
+)
+from app.ezpass.utils import clean_plate_number
+
+from app.leases.models import Lease
+from app.vehicles.models import Vehicle, VehicleRegistration
+from app.medallions.models import Medallion
+from app.ledger.models import LedgerEntry, LedgerSourceType
+
 from app.utils.logger import get_logger
-from app.ezpass.models import EZPassLog, EZPassTransaction
-from app.ezpass.utils import validate_ezpass_file, extract_amount
-from app.medallions.services import medallion_service
-from app.vehicles.services import vehicle_service
-from app.leases.services import lease_service
-from app.ledger.services import ledger_service
-from app.services.common import common_service
-from app.pvb.services import pvb_service
-from app.ledger.schemas import LedgerSourceType
 
 logger = get_logger(__name__)
 
 
+def get_ezpass_repository(db: AsyncSession = Depends(get_async_db)) -> EZPassRepository:
+    """Dependency to get EZPassRepository instance."""
+    return EZPassRepository(db)
+
+
 class EZPassService:
-    """EZPass services for operations"""
-    def get_ezpass_log(
-        self, db: Session,
-        log_id: Optional[int] = None,
-        log_from_date: Optional[datetime] = None,
-        log_to_date: Optional[datetime] = None,
-        log_status: Optional[str] = None,
-        log_type: Optional[str] = None,
-        records_impacted: Optional[int] = None,
-        success_count: Optional[int] = None,
-        unidentified_count: Optional[int] = None,
-        page: Optional[int] = 1,
-        per_page: Optional[int] = 10,
-        sort_order: Optional[str] = "desc",
-        sort_by: Optional[str] = "log_date",
-        multiple: Optional[bool] = False
-    ) -> Union[EZPassLog, List[EZPassLog]]:
-        """Get EZPass log by ID, date, or status"""
-        try:
-            query = db.query(EZPassLog)
+    """
+    Enhanced business logic layer for EZPass operations.
+    Implements complete association and posting logic.
+    """
 
-            if log_id:
-                query = query.filter(EZPassLog.id == log_id)
-            if log_status:
-                log_statuses = log_status.split(",")
-                query = query.filter(EZPassLog.status.in_(log_statuses))
-            if log_type:
-                log_types = log_type.split(",")
-                query = query.filter(EZPassLog.log_type.in_(log_types))
-            if log_from_date:
-                log_from_date = datetime.combine(log_from_date, datetime.min.time())
-                query = query.filter(
-                    EZPassLog.log_date >= log_from_date
-                )
-            if log_to_date:
-                log_to_date = datetime.combine(log_to_date, datetime.max.time())
-                query = query.filter(
-                    EZPassLog.log_date <= log_to_date
-                )
-            if records_impacted:
-                query = query.filter(EZPassLog.records_impacted == records_impacted)
-            if success_count:
-                query = query.filter(EZPassLog.success_count == success_count)
-            if unidentified_count:
-                query = query.filter(EZPassLog.unidentified_count == unidentified_count)
+    def __init__(self, repo: EZPassRepository = Depends(get_ezpass_repository)):
+        self.repo = repo
+        logger.debug("EZPassService initialized")
 
-            if multiple:
-                total_count = query.count()
-                if sort_order == "desc":
-                    query = query.order_by(getattr(EZPassLog, sort_by).desc())
-                else:
-                    query = query.order_by(getattr(EZPassLog, sort_by).asc())
+    async def get_transaction_by_id(self, transaction_id: int) -> EZPassTransaction:
+        """Get a single transaction by ID."""
+        logger.info("Getting transaction by ID", transaction_id=transaction_id)
 
-                if page and per_page:
-                    query = query.offset((page - 1) * per_page).limit(per_page)
-
-                return query.all(), total_count
-            return query.first()
-        except Exception as e:
-            logger.error("Error getting EZPass log: %s", str(e))
-            raise e
+        transaction = await self.repo.get_transaction_by_id(transaction_id)
+        if not transaction:
+            logger.error("Transaction not found", transaction_id=transaction_id)
+            raise EZPassTransactionNotFoundException(transaction_id)
+        
+        return transaction
     
-    def get_ezpass_transaction(
-        self, db: Session,
-        transaction_id: Optional[int] = None,
-        transaction_from_date: Optional[datetime] = None,
-        transaction_to_date: Optional[datetime] = None,
-        transaction_status: Optional[str] = None,
-        medallion_no: Optional[str] = None,
-        driver_id: Optional[str] = None,
-        plate_no: Optional[str] = None,
-        posting_from_date: Optional[datetime] = None,
-        posting_to_date: Optional[datetime] = None,
-        page: Optional[int] = None,
-        per_page: Optional[int] = None,
-        sort_order: Optional[str] = "desc",
-        sort_by: Optional[str] = "transaction_date",
-        multiple: Optional[bool] = False
-    ) -> Union[EZPassTransaction, List[EZPassTransaction]]:
-        """Get EZPass transaction by ID, date, or status"""
-        try:
-            query = db.query(EZPassTransaction)
+    async def get_transactions(
+        self,
+        filters: EZPassTransactionFilters,
+    ) -> Tuple[List[EZPassTransaction], int]:
+        """Get transactions with filters and pagination."""
+        logger.info("Getting transactions with filters", filters=filters.model_dump())
 
-            if transaction_id:
-                query = query.filter(EZPassTransaction.id == transaction_id)
-            if transaction_status:
-                transaction_statuses = transaction_status.split(",")
-                # Case insensitive matching for each transaction status
-                transaction_status_filters = [EZPassTransaction.status.ilike(f"%{status}%") for status in transaction_statuses]
-                query = query.filter(or_(*transaction_status_filters))
-            if transaction_from_date:
-                query = query.filter(
-                    EZPassTransaction.transaction_date >= transaction_from_date.date()
-                )
-            if transaction_to_date:
-                query = query.filter(
-                    EZPassTransaction.transaction_date <= transaction_to_date.date()
-                )
-            if posting_from_date:
-                query = query.filter(
-                    EZPassTransaction.posting_date >= posting_from_date
-                )
-            if posting_to_date:
-                query = query.filter(
-                    EZPassTransaction.posting_date <= posting_to_date
-                )
-            if medallion_no:
-                medallion_nos = medallion_no.split(",")
-                # Case insensitive matching for each medallion number
-                medallion_filters = [EZPassTransaction.medallion_no.ilike(f"%{medallion}%") for medallion in medallion_nos]
-                query = query.filter(or_(*medallion_filters))
-            if driver_id:
-                driver_ids = driver_id.split(",")
-                # Case insensitive matching for each driver id
-                driver_filters = [EZPassTransaction.driver_id.ilike(f"%{driver}%") for driver in driver_ids]
-                query = query.filter(or_(*driver_filters))
-            if plate_no:
-                plate_nos = plate_no.split(",")
-                # Case insensitive matching for each plate number
-                plate_filters = [EZPassTransaction.plate_no.ilike(f"%{plate}%") for plate in plate_nos]
-                query = query.filter(or_(*plate_filters))
+        try:
+            transactions, total_count = await self.repo.get_transactions(filters)
+            logger.info(
+                "Transactions retrieved successfully",
+                count=len(transactions),
+                total_count=total_count,
+            )
+            return transactions, total_count
+        except Exception as e:
+            logger.error("Error getting transactions", error=str(e), exc_info=True)
+            raise
 
-            if multiple:
-                total_count = query.count()
-                if sort_order == "desc":
-                    query = query.order_by(getattr(EZPassTransaction, sort_by).desc())
-                else:
-                    query = query.order_by(getattr(EZPassTransaction, sort_by).asc())
-                if page and per_page:
-                    query = query.offset((page - 1) * per_page).limit(per_page)
-                return query.all(), total_count
-            return query.first()
-        except Exception as e:
-            logger.error("Error getting EZPass transaction: %s", str(e))
-            raise e
-    
-    def upsert_ezpass_log(
-        self, db: Session,
-        log_data: dict
-    ):
-        """Upsert EZPass log"""
+    async def create_transaction(
+        self,
+        transaction_data: EZPassTransactionCreate,
+    ) -> EZPassTransaction:
+        """Create a new transaction."""
+        logger.info("Creating new transaction", data=transaction_data.model_dump())
+
         try:
-            if log_data.get("id"):
-                log = self.get_ezpass_log(db, log_id=log_data["id"])
-                if not log:
-                    raise ValueError("Log not found")
-                for key, value in log_data.items():
-                    setattr(log, key, value)
-            else:
-                log = EZPassLog(**log_data)
-            db.add(log)
-            db.commit()
-            db.refresh(log)
-            return log
-        except Exception as e:
-            logger.error("Error upserting EZPass log: %s", str(e))
-            db.rollback()
-            raise e
-    
-    def upsert_ezpass_transaction(
-        self, db: Session,
-        transaction_data: dict
-    ):
-        """Upsert EZPass transaction"""
-        try:
-            if transaction_data.get("id"):
-                transaction = self.get_ezpass_transaction(db, transaction_id=transaction_data["id"])
-                if not transaction:
-                    raise ValueError("Transaction not found")
-                for key, value in transaction_data.items():
-                    setattr(transaction, key, value)
-            else:
-                transaction = EZPassTransaction(**transaction_data)
-            db.add(transaction)
-            db.commit()
-            db.refresh(transaction)
+            transaction = await self.repo.create_transaction(transaction_data)
+            logger.info("Transaction created successfully", transaction_id=transaction.id)
             return transaction
         except Exception as e:
-            logger.error("Error upserting EZPass transaction: %s", str(e))
-            db.rollback()
-            raise e
-        
-    def process_ezpass_data(
-        self, db: Session, rows: List[dict]
-    ) -> dict:
-        """Process EZPass data"""
-        try:
-            log_data = {
-                "log_date": datetime.now(timezone.utc),
-                "log_type": "Import",
-                "records_impacted": len(rows),
-                "status": "In Progress"
-            }
-            log = self.upsert_ezpass_log(db, log_data)
+            logger.error("Error creating transaction", error=str(e), exc_info=True)
+            raise EZPassImportException(str(e)) from e
 
-            success = 0
-            failed_count = 0
-            failed_transactions = {}
+    async def update_transaction(
+        self,
+        transaction_id: int,
+        update_data: EZPassTransactionUpdate,
+    ) -> EZPassTransaction:
+        """Update an existing transaction."""
+        logger.info(
+            "Updating transaction",
+            transaction_id=transaction_id,
+            data=update_data.model_dump(exclude_unset=True)
+        )
+
+        try:
+            transaction = await self.get_transaction_by_id(transaction_id)
+            updated_transaction = await self.repo.update_transaction(transaction, update_data)
+            logger.info("Transaction updated successfully", transaction_id=transaction_id)
+            return updated_transaction
+        except EZPassTransactionNotFoundException:
+            raise
+        except Exception as e:
+            logger.error(
+                "Error updating transaction",
+                transaction_id=transaction_id,
+                error=str(e),
+                exc_info=True
+            )
+            raise EZPassUpdateException(transaction_id, str(e)) from e
+        
+    async def process_ezpass_data(
+        self,
+        rows: List[dict],
+        log_type: str = "Import"
+    ) -> EZPassImportResult:
+        """
+        Process and Import EZPass data from file.
+        """
+        logger.info("Processing EZPass data", rows_count=len(rows), log_type=log_type)
+
+        try:
+            # Create log entry
+            log_data = EZPassLogCreate(
+                log_date=datetime.now(timezone.utc),
+                log_type=log_type,
+                records_impacted=len(rows),
+                success_count=0,
+                unidentified_count=0,
+                status="Processing",
+            )
+            log = await self.repo.create_log(log_data)
+            logger.info("Import log created", log_id=log.id)
+
+            # === Process transactions ===
+            transactions_data = []
+            success_count = 0
+            unidentified_count = 0
 
             for row in rows:
                 try:
-                    # Map new headers to model fields
-                    trans_date_str = row.get("Date")
-                    exit_time_str = row.get("Exit Time")
-                    
-                    transaction_data = {
-                        "transaction_id": row.get("Lane Txn ID"),
-                        "transaction_date": datetime.strptime(trans_date_str, "%m/%d/%Y").date() if trans_date_str else None,
-                        "transaction_time": datetime.strptime(exit_time_str, "%I:%M %p").time() if exit_time_str else None,
-                        "tag_or_plate": row.get("Tag/Plate #"),
-                        "agency": row.get("Agency"),
-                        "entry_plaza": row.get("Entry Plaza"),
-                        "exit_plaza": row.get("Exit Plaza"),
-                        "amount": extract_amount(row.get("Amount")),
-                        "log_id": log.id,
-                        "status": "Imported"
-                    }
-                    self.upsert_ezpass_transaction(db, transaction_data)
-                    success += 1
+                    # === Clean and prepare data ===
+                    transaction_data = EZPassTransactionCreate(
+                        transaction_id=str(row.get("transaction_id", "")),
+                        transaction_date=row.get("transaction_date"),
+                        transaction_time=row.get("transaction_time"),
+                        plate_no=row.get("plate_no"),
+                        tag_or_plate=row.get("tag_or_plate") or row.get("plate_no", ""),
+                        agency=row.get("agency"),
+                        entry_plaza=row.get("entry_plaza"),
+                        exit_plaza=row.get("exit_plaza"),
+                        amount=float(row.get("amount", 0)),
+                        status="Imported",
+                        log_id=log.id,
+                    )
+                    transactions_data.append(transaction_data)
+                    success_count += 1
                 except Exception as e:
-                    failed_count += 1
-                    failed_transactions[row.get("Lane Txn ID", f"row_{failed_count}")] = str(e)
-                    logger.error(f"Error processing row: {row}. Error: {e}")
+                    logger.warning("Failed to process row", row=row, error=str(e))
+                    unidentified_count += 1
 
-            # Finalize the log
-            self.upsert_ezpass_log(db, {
-                "id": log.id, "success_count": success, "unidentified_count": failed_count,
-                "status": "Partial" if failed_count > 0 else "Success"
-            })
-            
-            # Trigger the association process after a successful import
-            if success > 0:
-                self.associate_records(db)
+            # === Bulk create transactions ===
+            if transactions_data:
+                await self.repo.bulk_create_transactions(transactions_data)
+                logger.info("Transactions imported successfully", count=len(transactions_data))
 
+            # === Update log ===
+            await self.repo.update_log(
+                log,
+                success_count=success_count,
+                unidentified_count=unidentified_count,
+                status="Success" if unidentified_count == 0 else "Partial"
+            )
 
-            return {
-                "message": "Imported completed",
-                "success": success,
-                "failed": failed_count,
-                "log_id": log.id,
-                "transaction_failed": failed_transactions
-            }
+            result = EZPassImportResult(
+                success=True,
+                log_id=log.id,
+                records_impacted=len(rows),
+                success_count=success_count,
+                unidentified_count=unidentified_count,
+                message=f"Successfully imported {success_count} records, {unidentified_count} failed"
+            )
+
+            logger.info("EZPass data processing completed", result=result.model_dump())
+            return result
+
         except Exception as e:
-            logger.error("Error processing EZPass data: %s", str(e))
-            raise e
+            logger.error("Error processing EZPass data", error=str(e), exc_info=True)
+            raise EZPassImportException(str(e)) from e
         
-    def associate_records(self, db: Session) -> dict:
+    async def associate_transactions(self) -> EZPassAssociationResult:
         """
-        Associate imported EZPass transactions with vehicles and drivers using CURB data.
+        Associate imported transactions with vehicles, drivers, and medallions.
+
+        Logic:
+        1. Get all unassociated transactions (status='Imported')
+        2. For each transaction, find active lease by plate number
+        3. Get vehicle, driver, and medallion from the lease
+        4. Update transaction with associations
+        5. Mark as 'Associated' or 'Failed'
         """
-        from app.drivers.services import driver_service
-        transactions, _ = self.get_ezpass_transaction(db, transaction_status="Imported", multiple=True)
-        associated, failed = 0, 0
+        logger.info("Starting transaction association process")
 
-        log = self.upsert_ezpass_log(db, {
-            "log_date": datetime.now(timezone.utc), "log_type": "Associate",
-            "records_impacted": len(transactions), "status": "In Progress"
-        })
+        try:
+            # === Get unassociated transactions ===
+            transactions = await self.repo.get_unassociated_transactions()
+            logger.info("Found unassociated transactions", count=len(transactions))
 
-        for txn in transactions:
-            update_data = {"id": txn.id}
-            try:
-                tag_or_plate = txn.tag_or_plate
-                
-                # --- LOGIC TO IDENTIFY PLATE NUMBER ---
-                # A simple heuristic: if it contains letters, it's a plate.
-                # E-ZPass tags are typically numeric. This can be made more robust if needed.
-                plate_number = None
-                if any(c.isalpha() for c in tag_or_plate):
-                    # It's likely a plate, may have state prefix e.g., "NY T123456C"
-                    plate_number = tag_or_plate.split()[-1] # Get the last part
-                else:
-                    # It's a tag ID, find the vehicle associated with this tag to get the plate
-                    # (This is a placeholder for a future enhancement if you track tag assignments)
-                    raise ValueError(f"Tag ID '{tag_or_plate}' found. Association by tag not yet implemented.")
-                
-                txn.plate_no = plate_number
-                
-                # Use the common service to find the driver from CURB trip data
-                driver_id, _ = common_service.resolve_driver_from_curb(db, plate_number, txn.transaction_date)
-                
-                if not driver_id:
-                    raise ValueError("Driver could not be resolved from CURB data for the given plate and date.")
+            if not transactions:
+                return EZPassAssociationResult(
+                    success=True,
+                    total_transactions=0,
+                    associated_count=0,
+                    failed_count=0,
+                    message="No unassociated transactions found"
+                )
+            
+            associated_count = 0
+            failed_count = 0
+            db = self.repo.db
 
-                vehicle = vehicle_service.get_vehicles(db, plate_number=plate_number)
-                lease = lease_service.get_lease(db, vehicle_id=vehicle.id, driver_id=driver_id)
-                driver = driver_service.get_drivers(db, driver_id=driver_id)
-                update_data.update({
-                    "vehicle_id": vehicle.id if vehicle else None,
-                    "driver_id": driver.id,
-                    "medallion_no": lease.medallion.medallion_number if lease and lease.medallion else None,
-                    "status": "Associated"
-                })
-                associated += 1
-            except Exception as e:
-                update_data.update({"status": "Association Failed", "associate_failed_reason": str(e)})
-                failed += 1
-                logger.warning(f"Failed to associate EZPass Txn {txn.id}: {e}")
+            for transaction in transactions:
+                try:
+                    logger.debug(
+                        "Processing transaction for association",
+                        transaction_id=transaction.id,
+                        plate_no=transaction.plate_no
+                    )
 
-            self.upsert_ezpass_transaction(db, update_data)
+                    # === Find active lease by plate number ===
+                    lease_data = await self._find_active_lease_by_plate(
+                        db, transaction.plate_no, transaction.transaction_date
+                    )
+
+                    if not lease_data:
+                        logger.warning(
+                            "No active lease found for transaction",
+                            transaction_id=transaction.id,
+                            plate_no=transaction.plate_no
+                        )
+
+                        update_data = EZPassTransactionUpdate(
+                            status="Failed",
+                            associate_failed_reason=f"No active lease found for plate: {transaction.plate_no}"
+                        )
+                        await self.repo.update_transaction(transaction, update_data)
+                        failed_count += 1
+                        continue
+
+                    # === Update transaction with associations ===
+                    update_data = EZPassTransactionUpdate(
+                        status="Associated",
+                        driver_id=lease_data.get("driver_id"),
+                        vehicle_id=lease_data.get("vehicle_id"),
+                        medallion_no=lease_data.get("medallion_no"),
+                        associate_failed_reason=None
+                    ),
+
+                    await self.repo.update_transaction(transaction, update_data)
+                    associated_count += 1
+
+                    logger.info(
+                        "Transaction associated successfully",
+                        transaction_id=transaction.id,
+                        lease_id=lease_data.get("lease_id"),
+                        driver_id=lease_data.get("driver_id"),
+                        vehicle_id=lease_data.get("vehicle_id")
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to associate transaction",
+                        transaction_id=transaction.id,
+                        error=str(e),
+                        exc_info=True
+                    )
+                    update_data = EZPassTransactionUpdate(
+                        status="Failed",
+                        associate_failed_reason=f"Association error: {str(e)}"
+                    )
+                    await self.repo.update_transaction(transaction, update_data)
+                    failed_count += 1
+
+            # === Create association log ===
+            log_data = EZPassLogCreate(
+                log_date=datetime.now(timezone.utc),
+                log_type="Associate",
+                records_impacted=len(transactions),
+                success_count=associated_count,
+                unidentified_count=failed_count,
+                status="Success" if failed_count == 0 else "Partial"
+            )
+            await self.repo.create_log(log_data)
+
+            result = EZPassAssociationResult(
+                success=True,
+                total_processed=len(transactions),
+                associated_count=associated_count,
+                failed_count=failed_count,
+                message=f"Associated {associated_count} transactions, {failed_count} failed"
+            )
+
+            logger.info("Transaction association completed", result=result.model_dump())
+            return result
+
+        except Exception as e:
+            logger.error("Error associating transactions", error=str(e), exc_info=True)
+            raise EZPassAssociationException(str(e)) from e
         
-        # Finalize log
-        self.upsert_ezpass_log(db, {"id": log.id, "success_count": associated, "unidentified_count": failed, "status": "Partial" if failed > 0 else "Success"})
+    async def post_transactions_to_ledger(self) -> EZPassPostingResult:
+        """
+        Post associated transactions to the central ledger.
         
-        # Trigger posting after association
-        if associated > 0:
-            self.post_ezpass(db)
+        Logic:
+        1. Get all unposted transactions (status='Associated')
+        2. For each transaction, create ledger entry
+        3. Mark transaction as 'Posted' with posting_date
+        4. Handle errors and mark as 'Failed' if posting fails
+        """
+        logger.info("Starting transaction posting to ledger")
 
-        return {"associated": associated, "failed": failed, "log_id": log.id}
+        try:
+            # === Get unposted transactions ===
+            transactions = await self.repo.get_unposted_transactions()
+            logger.info("Found unposted transactions", count=len(transactions))
 
-    def post_ezpass(
-        self, db: Session
-    ) -> dict:
-        """Post EZPass"""
-        transactions , total_count = self.get_ezpass_transaction(db, transaction_status="Associated", multiple=True)
-        posted, failed = 0, 0
+            if not transactions:
+                return EZPassPostingResult(
+                    success=True,
+                    total_processed=0,
+                    posted_count=0,
+                    failed_count=0,
+                    message="No transactions to post"
+                )
+            
+            posted_count = 0
+            failed_count = 0
+            db = self.repo.db
 
-        log_data = {
-            "log_date": datetime.now(timezone.utc),
-            "log_type": "Post",
-            "records_impacted": len(transactions),
-            "status": "Pending"
-        }
-        log = self.upsert_ezpass_log(db, log_data)
+            for transaction in transactions:
+                try:
+                    logger.debug(
+                        "Processing transaction for posting",
+                        transaction_id=transaction.id,
+                        driver_id=transaction.driver_id,
+                        vehicle_id=transaction.vehicle_id
+                    )
 
-        for transaction in transactions:
-            transaction_data = {}
-            try:
-                if not all([transaction.driver_id, transaction.medallion_no, transaction.vehicle_id, transaction.amount]):
-                    transaction_data["status"] = "Posting Failed"
-                    transaction["post_failed_reason"] = "Missing required fields"
-                    failed += 1
-                    continue
+                    # === Get full lease details for posting ===
+                    lease_data = await self._get_lease_for_transaction(db, transaction)
 
-                medallion = medallion_service.get_medallion(db, medallion_number=transaction.medallion_no)
-                ledger_service.upsert_ledgers(db, {
-                    "driver_id": transaction.driver_id,
-                    "medallion_id": int(medallion.id),
-                    "vehicle_id": int(transaction.vehicle_id),
-                    "amount": transaction.amount,
-                    "debit": True,
-                    "description": f"EZPass toll posted on {transaction.transaction_date} for plate {transaction.plate_no}",
-                    "source_type": LedgerSourceType.EZPASS,
-                    "source_id": transaction.id
-                })
-                transaction_data["status"] = "Posted"
-                transaction_data["posting_date"] = datetime.now(timezone.utc).date()
-                posted += 1
-            except Exception as e:
-                transaction_data["status"] = "Posting Failed"
-                transaction_data["post_failed_reason"] = str(e)
-                failed += 1
+                    if not lease_data:
+                        logger.warning(
+                            "No lease data found for posting",
+                            transaction_id=transaction.id
+                        )
+                        update_data = EZPassTransactionUpdate(
+                            status="Failed",
+                            post_failed_reason="No lease data found for posting"
+                        )
+                        await self.repo.update_transaction(transaction, update_data)
+                        failed_count += 1
+                        continue
 
-            self.upsert_ezpass_transaction(db , transaction_data= {"id": transaction.id, **transaction_data})
+                    # === Create ledger entry ===
+                    ledger_entry = await self._create_ledger_entry(
+                        db, transaction, lease_data
+                    )
 
-        log_data["id"] = log.id
-        log_data["success_count"] = posted
-        log_data["unidentified_count"] = failed
-        log_data["status"] = "Partial" if failed else "Success"
-        self.upsert_ezpass_log(db, log_data)
+                    if ledger_entry:
+                        # === Update transaction as posted ===
+                        update_data = EZPassTransactionUpdate(
+                            status="Posted",
+                            posting_date=datetime.now(timezone.utc).date(),
+                            post_failed_reason=None
+                        )
+                        await self.repo.update_transaction(transaction, update_data)
+                        posted_count += 1
 
-        return {
-            "message": "Posting to central ledger",
-            "posted": posted,
-            "failed": failed,
-            "log_id": log.id
-        }
+                        logger.info(
+                            "Transaction posted successfully",
+                            transaction_id=transaction.id,
+                            ledger_id=ledger_entry.id
+                        )
+                    else:
+                        update_data = EZPassTransactionUpdate(
+                            status="Failed",
+                            post_failed_reason="Failed to create ledger entry"
+                        )
+                        await self.repo.update_transaction(transaction, update_data)
+                        failed_count += 1
 
-ezpass_service = EZPassService()
+                except Exception as e:
+                    logger.error(
+                        "Failed to post transaction",
+                        transaction_id=transaction.id,
+                        error=str(e),
+                        exc_info=True
+                    )
+                    update_data = EZPassTransactionUpdate(
+                        status="Failed",
+                        post_failed_reason=f"Posting error: {str(e)}"
+                    )
+                    await self.repo.update_transaction(transaction, update_data)
+                    failed_count += 1
+
+            # === Create posting log ===
+            log_data = EZPassLogCreate(
+                log_date=datetime.now(timezone.utc),
+                log_type="Post",
+                records_impacted=len(transactions),
+                success_count=posted_count,
+                unidentified_count=failed_count,
+                status="Success" if failed_count == 0 else "Partial"
+            )
+            await self.repo.create_log(log_data)
+
+            result = EZPassPostingResult(
+                success=True,
+                total_processed=len(transactions),
+                posted_count=posted_count,
+                failed_count=failed_count,
+                message=f"Posted {posted_count} transactions, {failed_count} failed"
+            )
+
+            logger.info("Transaction posting completed", result=result.model_dump())
+            return result
+
+        except Exception as e:
+            logger.error("Error posting transactions to ledger", error=str(e), exc_info=True)
+            raise EZPassPostingException(str(e)) from e
+        
+    # === Helper Methods ===
+
+    async def _find_active_lease_by_plate(
+        self,
+        db: AsyncSession,
+        plate_no: str,
+        transaction_date: date
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Find active lease for a vehicle by plate number on the transaction date.
+
+        Returns dictionary with lease_id, driver_id, vehicle_id, medallion_no
+        """
+        if not plate_no:
+            return None
+        
+        # === Clean plate number for matching ===
+        cleaned_plate = clean_plate_number(plate_no)
+
+        logger.debug(
+            "Searching for active lease",
+            plate_no=plate_no,
+            cleaned_plate=cleaned_plate,
+            transaction_date=transaction_date
+        )
+
+        try:
+            # === Query to find vehicle by plate number (current or historical registration) ===
+            vehicle_stmt = select(Vehicle).join(
+                VehicleRegistration,
+                Vehicle.id == VehicleRegistration.vehicle_id
+            ).where(
+                or_(
+                    VehicleRegistration.plate_number.like(f"{plate_no}%"),
+                    VehicleRegistration.plate_number.like(f"{cleaned_plate}%")
+                )
+            )
+
+            vehicle_result = await db.execute(vehicle_stmt)
+            vehicle = vehicle_result.scalar_one_or_none()
+            
+
+            if not vehicle:
+                logger.debug("No vehicle found for plate number", plate_no=plate_no)
+                return None
+            
+            logger.debug("Vehicle found", vehicle_id=vehicle.id, plate_no=plate_no)
+
+            # === Find active lease for this vehicle on the transaction date ===
+            lease_stmt = select(Lease).options(
+                selectinload(Lease.lease_driver)
+            ).where(
+                and_(
+                    Lease.vehicle_id == vehicle.id,
+                    Lease.lease_start_date <= transaction_date,
+                    or_(
+                        Lease.lease_end_date >= transaction_date,
+                        Lease.lease_end_date.is_(None)
+                    ),
+                    Lease.lease_status == "Active"
+                )
+            ).order_by(Lease.lease_start_date.desc())
+
+            lease_result = await db.execute(lease_stmt)
+            lease = lease_result.scalar_one_or_none()
+
+            if not lease:
+                logger.debug(
+                    "No active lease found for vehicle",
+                    vehicle_id=vehicle.id,
+                    transaction_date=transaction_date,
+                )
+                return None
+
+            # === Get primary driver from lease ===
+            driver_id = None
+            if lease.lease_driver:
+                # === Get the primary driver or the first driver ===
+                primary_driver = next(
+                    (ld for ld in lease.lease_driver if ld.col_lease_seq == 1),
+                    lease.lease_driver[0] if lease.lease_driver else None
+                )
+                if primary_driver:
+                    driver_id = primary_driver.driver_id
+
+            # === Get medallion number ===
+            medallion_no = None
+            if lease.medallion_id:
+                medallion_stmt = select(Medallion.medallion_number).where(
+                    Medallion.id == lease.medallion_id
+                )
+                medallion_result = await db.execute(medallion_stmt)
+                medallion_no = medallion_result.scalar_one_or_none()
+
+            result = {
+                "lease_id": lease.id,
+                "driver_id": driver_id,
+                "vehicle_id": vehicle.id,
+                "medallion_no": medallion_no,
+                "medallion_id": lease.medallion_id,
+            }
+
+            logger.info(
+                "Active lease found",
+                lease_id=lease.id,
+                vehicle_id=vehicle.id,
+                driver_id=driver_id,
+                medallion_no=medallion_no
+            )
+            return result
+
+        except Exception as e:
+            logger.error(
+                "Error finding active lease",
+                plate_no=plate_no,
+                error=str(e),
+                exc_info=True
+            )
+            return None
+        
+    async def _get_lease_for_transaction(
+        self,
+        db: AsyncSession,
+        transaction: EZPassTransaction
+    ) -> Optional[Dict[str, Any]]:
+        """Get full lease details for a transaction."""
+        if not transaction.vehicle_id:
+            return None
+
+        try:
+            # === Get lease with all related data ===
+            lease_stmt = select(Lease).options(
+                selectinload(Lease.lease_driver),
+                selectinload(Lease.vehicle),
+                selectinload(Lease.medallion)
+            ).where(
+                and_(
+                    Lease.vehicle_id == transaction.vehicle_id,
+                    Lease.lease_start_date <= transaction.transaction_date,
+                    or_(
+                        Lease.lease_end_date >= transaction.transaction_date,
+                        Lease.lease_end_date.is_(None)
+                    ),
+                    Lease.lease_status == "Active"
+                )
+            ).order_by(Lease.lease_start_date.desc())
+
+            lease_result = await db.execute(lease_stmt)
+            lease = lease_result.scalar_one_or_none()
+
+            if not lease:
+                return None
+            
+            return {
+                "lease_id": lease.id,
+                "driver_id": transaction.driver_id,
+                "vehicle_id": lease.vehicle_id,
+                "medallion_id": lease.medallion_id,
+                "medallion_no": transaction.medallion_no,
+                "lease": lease,
+            }
+        
+        except Exception as e:
+            logger.error(
+                "Error getting lease for transaction",
+                transaction_id=transaction.id,
+                error=str(e)
+            )
+            return None
+        
+    async def _create_ledger_entry(
+        self,
+        db: AsyncSession,
+        transaction: EZPassTransaction,
+        lease_data: Dict[str, Any],
+    ) -> Optional[LedgerEntry]:
+        """
+        Create ledger entry for EZPass transaction
+
+        This creates a debit entry for the driver/lease.
+        """
+        try:
+            # === Create ledger entry ===
+            ledger_entry = LedgerEntry(
+                transaction_date=transaction.transaction_date,
+                posting_date=datetime.now(timezone.utc).date(),
+                amount=transaction.amount,
+                transaction_type="Debit",
+                description=f"EZPass - {transaction.agency or 'Toll'} - {transaction.plate_no}",
+                reference_number=transaction.transaction_id,
+                source_type=LedgerSourceType.EZPASS,
+                source_id=transaction.id,
+                driver_id=transaction.driver_id,
+                vehicle_id=transaction.vehicle_id,
+                lease_id=lease_data.get("lease_id"),
+                medallion_id=lease_data.get("medallion_id"),
+                status="Posted",
+                notes=f"Entry: {transaction.entry_plaza}, Exit: {transaction.exit_plaza}",
+            )
+
+            db.add(ledger_entry)
+            await db.flush()
+            await db.refresh(ledger_entry)
+
+            logger.info(
+                "Ledger entry created",
+                ledger_id=ledger_entry.id,
+                transaction_id=transaction.id,
+                amount=transaction.amount
+            )
+
+            return ledger_entry
+
+        except Exception as e:
+            logger.error(
+                "Error creating ledger entry",
+                transaction_id=transaction.id,
+                error=str(e),
+                exc_info=True
+            )
+            return None
+        
+    # === Log operations ===
+
+    async def get_log_by_id(self, log_id: int) -> EZPassLog:
+        """Get a single log by ID."""
+        logger.info("Getting log by ID", log_id=log_id)
+
+        log = await self.repo.get_log_by_id(log_id)
+        if not log:
+            logger.error("Log not found", log_id=log_id)
+            raise EZPassLogNotFoundException(log_id)
+        
+        return log
+
+    async def get_logs(
+        self,
+        filters: EZPassLogFilters
+    ) -> Tuple[List[EZPassLog], int]:
+        """Get logs with filters and pagination."""
+        logger.info("Getting logs with filters", filters=filters.model_dump())
+
+        try:
+            logs, total_count = await self.repo.get_logs(filters)
+            logger.info(
+                "Logs retrieved successfully",
+                count=len(logs),
+                total_count=total_count,
+            )
+            return logs, total_count
+        except Exception as e:
+            logger.error("Error getting logs", error=str(e), exc_info=True)
+            raise
+
+
+    
+
+                
+
+    
+

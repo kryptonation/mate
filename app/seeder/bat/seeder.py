@@ -26,7 +26,7 @@ from app.seeder.bat.parse_drivers import parse_drivers
 from app.seeder.bat.parse_leases import parse_lease
 from app.seeder.bat.parse_lease_driver import parse_lease_driver
 from app.seeder.bat.parse_crub_trips import parse_crub_trips
-from app.seeder.bat.parse_ezpass import parse_ezpass
+# from app.seeder.bat.parse_ezpass import parse_ezpass
 from app.seeder.bat.parse_pvb import parse_pvb
 from app.seeder.bat.parse_vehicle_entity import parse_vehicle_entity
 from app.seeder.bat.parse_daily_receipts import parse_daily_receipts
@@ -53,7 +53,7 @@ SHEET_PARSERS = {
     "lease_driver": parse_lease_driver,
     "mo_lease": parse_mo_lease,
     "curb_trip": parse_crub_trips,
-    "ezpass": parse_ezpass,
+    # "ezpass": parse_ezpass,
     "pvb": parse_pvb,
     "daily_receipts": parse_daily_receipts
 }
