@@ -1,55 +1,103 @@
-### app/pvb/models.py
+# app/pvb/models.py
 
-# Third party imports
+"""
+SQLAlchemy 2.x models for PVB (Parking Violation Bureau) module.
+"""
+
+from datetime import datetime, timezone
+from typing import Optional, List
+
 from sqlalchemy import (
-    Column, Integer, String, Date, Time, DateTime, Text, ForeignKey
+    Integer, String, Date, DateTime, Text, ForeignKey, Boolean,
+    UniqueConstraint,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-# Local imports
 from app.core.db import Base
 from app.users.models import AuditMixin
 
 
 class PVBViolation(Base, AuditMixin):
-    """PVB Violation model"""
+    """
+    PVB Violation model representing parking violations.
+
+    Stores violation details including plate information, dates, amounts,
+    and associations to drivers, medallions, and vehicles.
+    """
     __tablename__ = "pvb_violations"
 
-    id = Column(Integer, primary_key=True, index=True)
-    plate_number = Column(String(64), nullable=False, index=True)
-    state = Column(String(2), nullable=False)
-    vehicle_type = Column(String(24), nullable=False)
-    summons_number = Column(String(32), nullable=True, unique=True)
-    issue_date = Column(Date, nullable=False)
-    issue_time = Column(String(16), nullable=True)
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
 
-    amount_due = Column(Integer, nullable=True)
-    amount_paid = Column(Integer, nullable=True, default=0)
+    plate_number: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    state: Mapped[str] = mapped_column(String(2), nullable=False)
+    vehicle_type: Mapped[Optional[str]] = mapped_column(String(24), nullable=True)
+    summons_number: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True, unique=True, index=True
+    )
 
-    driver_id = Column(Integer, ForeignKey("drivers.id"), nullable=True)
-    medallion_id = Column(Integer, ForeignKey("medallions.id"), nullable=True)
-    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), nullable=True)
+    issue_date: Mapped[Date] = mapped_column(Date, nullable=False, index=True)
+    issue_time: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
 
-    status = Column(String(50), nullable=False, default="Imported")
-    associated_failed_reason = Column(Text, nullable=True)
-    post_failed_reason = Column(Text, nullable=True)
+    amount_due: Mapped[int] = mapped_column(default=0)
+    amount_paid: Mapped[int] = mapped_column(default=0)
 
-    log_id = Column(Integer, ForeignKey("pvb_logs.id"), nullable=True)
+    driver_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("drivers.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    medallion_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("medallions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    vehicle_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("vehicles.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    log_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("pvb_logs.id", ondelete="SET NULL"), nullable=True
+    )
 
-    # Relationships
-    log = relationship("PVBLog", back_populates="violations")
+    status: Mapped[str] = mapped_column(
+        String(48), nullable=False, default="Imported", index=True
+    )
+    associated_failed_reason: Mapped[str] = mapped_column(Text, nullable=True)
+    post_failed_reason: Mapped[str] = mapped_column(Text, nullable=True)
 
+    log: Mapped["PVBLog"] = relationship("PVBLog", back_populates="violations")
+    driver: Mapped["Driver"] = relationship("Driver", foreign_keys=[driver_id])
+    medallion: Mapped["Medallion"] = relationship("Medallion", foreign_keys=[medallion_id])
+    vehicle: Mapped["Vehicle"] = relationship("Vehicle", foreign_keys=[vehicle_id])
+
+    def __repr__(self) -> str:
+        return f"<PVBViolation(id={self.id}, plate={self.plate_number}, summons={self.summons_number})>"
+    
 
 class PVBLog(Base, AuditMixin):
-    """PVB Log model"""
+    """
+    PVB Log for tracking import, association, and posting operations.
+    """
     __tablename__ = "pvb_logs"
 
-    id = Column(Integer, primary_key=True, index=True)
-    log_date = Column(DateTime, nullable=False)
-    log_type = Column(String(50), nullable=False)
-    records_impacted = Column(Integer, nullable=True)
-    success_count = Column(Integer, nullable=True, default=0)
-    unidentified_count = Column(Integer, nullable=True, default=0)
-    status = Column(String(50), nullable=False)
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
 
-    violations = relationship("PVBViolation", back_populates="log")
+    log_date: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True,
+    )
+    log_type: Mapped[str] = mapped_column(
+        String(48), nullable=False, index=True,
+        comment="Type of operation: Import, Associate, Post"
+    )
+
+    records_impacted: Mapped[int] = mapped_column(Integer, nullable=True)
+    success_count: Mapped[int] = mapped_column(Integer, nullable=True, default=0)
+    unidentified_count: Mapped[int] = mapped_column(Integer, nullable=True, default=0)
+
+    status: Mapped[str] = mapped_column(
+        String(48), nullable=False, default="Pending",
+        comment="Status: Pending, Success, Failure, Partial"
+    )
+
+    violations: Mapped[List["PVBViolation"]] = relationship(
+        "PVBViolation", back_populates="log"
+    )
+
+    def __repr__(self) -> str:
+        return f"<PVBLog(id={self.id}, type={self.log_type}, date={self.log_date})>"
+    
