@@ -1,107 +1,171 @@
-## app/curb/models.py
+# app/curb/models.py
 
 """
-CURB Trip Models
-
-This module contains the SQLAlchemy models for CURB trips.
+SQLAlchemy 2.x models for CURB (Taxi Fleet) module.
 """
-# Standard library imports
-from datetime import datetime
 
-# Third party imports
+from datetime import datetime, timezone, date, time
+from typing import Optional
+
 from sqlalchemy import (
-    Column, Integer, String, Date, Float, Boolean, ForeignKey, Time , DateTime,
-    Text
+    String, Date, Time, DateTime, Float, Boolean, ForeignKey, Text,
+    UniqueConstraint, Index,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-# Local imports
 from app.core.db import Base
+from app.users.models import AuditMixin
 
 
-class CURBTrip(Base):
-    """Model for CURB trips."""
+class CURBTrip(Base, AuditMixin):
+    """
+    CURB Trip model representing taxi trip data from the CURB system.
+
+    Stores trip details including location, fare breakdown, payment information,
+    and associations to drivers, medallions, and vehicles.
+    """
     __tablename__ = "curb_trips"
 
-    id = Column(Integer, primary_key=True, index=True)
+    __table_args__ = (
+        Index('idx_curb_trip_record_period', 'record_id', 'period'),
+        Index('idx_curb_trip_dates', 'start_date', 'end_date'),
+        Index('idx_curb_trip_cab_driver', 'cab_number', 'driver_id'),
+        Index('idx_curb_trip_reconcile', 'is_reconciled', 'is_posted'),
+    )
 
-    record_id = Column(String(32), nullable=False, index=True)
-    period = Column(String(12), nullable=True)
-    trip_number = Column(String(32), nullable=True)
-    cab_number = Column(String(16), nullable=False)
-    driver_id = Column(String(32), nullable=False)
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
 
-    start_date = Column(Date)
-    end_date = Column(Date)
-    start_time = Column(Time)
-    end_time = Column(Time)
+    record_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    period: Mapped[Optional[str]] = mapped_column(String(12), nullable=True)
+    trip_number: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
 
-    trip_amount = Column(Float)
-    tips = Column(Float)
-    extras = Column(Float)
-    tolls = Column(Float)
-    tax = Column(Float)
-    imp_tax = Column(Float)
-    total_amount = Column(Float)
+    cab_number: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    driver_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
 
-    gps_start_lat = Column(Float)
-    gps_start_lon = Column(Float)
-    gps_end_lat = Column(Float)
-    gps_end_lon = Column(Float)
+    start_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    start_time: Mapped[Optional[time]] = mapped_column(Time, nullable=True)
+    end_time: Mapped[Optional[time]] = mapped_column(Time, nullable=True)
 
-    from_address = Column(String(255))
-    to_address = Column(String(255))
-    payment_type = Column(String(2)) # T = Cash, P = private, C = Creit Card
-    cc_number = Column(String(32))
-    auth_code = Column(String(32))
-    auth_amount = Column(Float)
+    trip_amount: Mapped[float] = mapped_column(Float, default=0.0)
+    tips: Mapped[float] = mapped_column(Float, default=0.0)
+    extras: Mapped[float] = mapped_column(Float, default=0.0)
+    tolls: Mapped[float] = mapped_column(Float, default=0.0)
+    tax: Mapped[float] = mapped_column(Float, default=0.0)
+    imp_tax: Mapped[float] = mapped_column(Float, default=0.0)
+    total_amount: Mapped[float] = mapped_column(Float, default=0.0)
 
-    ehail_fee = Column(Float)
-    health_fee = Column(Float)
-    passengers = Column(Integer)
-    distance_service = Column(Float)
-    distance_bs = Column(Float)
-    reservation_number = Column(String(64))
-    congestion_fee = Column(Float)
-    airport_fee = Column(Float)
-    cbdt_fee = Column(Float)
+    gps_start_lat: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    gps_start_lon: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    gps_end_lat: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    gps_end_lon: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
-    imported_at = Column(DateTime, default=datetime.now)
-    is_reconciled = Column(Boolean, default=False)
-    is_posted = Column(Boolean, default=False)
-    recon_stat = Column(Integer)
+    from_address: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    to_address: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
-    import_id = Column(Integer, ForeignKey("curb_import_logs.id"))
-    import_log = relationship("CURBImportLog", back_populates="trips")
-    reconcilation_entry = relationship(
-    "CURBTripReconcilation",
-    back_populates="trip")
+    payment_type: Mapped[str] = mapped_column(String(2), nullable=False)
+    cc_number: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    auth_code: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    auth_amount: Mapped[float] = mapped_column(Float, default=0.0)
 
+    ehail_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    health_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    congestion_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    airport_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    cbdt_fee: Mapped[float] = mapped_column(Float, default=0.0)
 
-class CURBImportLog(Base):
-    """Model for CURB import logs."""
+    passengers: Mapped[int] = mapped_column(default=1)
+    distance_service: Mapped[float] = mapped_column(Float, default=0.0)
+    distance_bs: Mapped[float] = mapped_column(Float, default=0.0)
+    reservation_number: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    is_reconciled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    is_posted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    recon_stat: Mapped[Optional[int]] = mapped_column(nullable=True)
+
+    status: Mapped[str] = mapped_column(String(48), nullable=False, default="Imported", index=True)
+    associate_failed_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    post_failed_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    import_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("curb_import_logs.id", ondelete="SET NULL"), nullable=True
+    )
+    driver_fk: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("drivers.id", ondelete="SET NULL"), nullable=True
+    )
+    medallion_fk: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("medallions.id", ondelete="SET NULL"), nullable=True
+    )
+    vehicle_fk: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("vehicles.id", ondelete="SET NULL"), nullable=True
+    )
+
+    import_log: Mapped["CURBImportLog"] = relationship("CURBImportLog", back_populates="trips")
+    reconcilation: Mapped[Optional["CURBTripReconciliation"]] = relationship(
+        "CURBTripReconciliation", back_populates="trip", uselist=False
+    )
+    driver: Mapped[Optional["Driver"]] = relationship("Driver", foreign_keys=[driver_fk])
+    medallion: Mapped[Optional["Medallion"]] = relationship("Medallion", foreign_keys=[medallion_fk])
+    vehicle: Mapped[Optional["Vehicle"]] = relationship("Vehicle", foreign_keys=[vehicle_fk])
+
+    def __repr__(self) -> str:
+        return f"<CURBTrip(id={self.id}, record_id={self.record_id}, cab={self.cab_number})>"
+    
+
+class CURBImportLog(Base, AuditMixin):
+    """
+    CURB Import Log for tracking import operations.
+    """
     __tablename__ = "curb_import_logs"
 
-    id = Column(Integer, primary_key=True, index=True)
-    imported_by = Column(String(64), default="SYSTEM")
-    import_start = Column(DateTime, default=datetime.now)
-    import_end = Column(DateTime)
-    import_source = Column(String(64)) # SOAP, Upload, etc
-    total_records = Column(Integer, default=0)
-    status = Column(String(32), default="IN_PROGRESS")
-    error_summary = Column(Text)
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
 
-    trips = relationship("CURBTrip", back_populates="import_log")
+    import_source: Mapped[str] = mapped_column(String(64), nullable=False)
+    imported_by: Mapped[str] = mapped_column(String(64), default="SYSTEM")
 
+    import_start: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    import_end: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
-class CURBTripReconcilation(Base):
-    """Model for CURB trip reconcilation."""
-    __tablename__ = "curb_trip_reconcilation"
+    total_records: Mapped[int] = mapped_column(default=0)
+    success_count: Mapped[int] = mapped_column(default=0)
+    failure_count: Mapped[int] = mapped_column(default=0)
+    duplicate_count: Mapped[int] = mapped_column(default=0)
 
-    id = Column(Integer, primary_key=True, index=True)
-    trip_id = Column(Integer, ForeignKey("curb_trips.id"), nullable=False)
-    recon_stat = Column(Integer, nullable=False)
-    reconciled_at = Column(DateTime, default=datetime.now)
-    reconciled_by = Column(String(64), default="SYSTEM")
+    status: Mapped[str] = mapped_column(String(32), default="IN_PROGRESS", index=True)
+    error_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    trip = relationship("CURBTrip", back_populates="reconcilation_entry")
+    trips: Mapped[list["CURBTrip"]] = relationship("CURBTrip", back_populates="import_log")
+
+    def __repr__(self) -> str:
+        return f"<CURBImportLog(id={self.id}, status={self.status}, records={self.total_records})>"
+    
+
+class CURBTripReconciliation(Base, AuditMixin):
+    """
+    CURB Trip Reconciliation tracking.
+    Records when trips are marked as reconciled with the CURB system.
+    """
+    __tablename__ = "curb_trip_reconciliation"
+
+    __table_args__ = (
+        UniqueConstraint('trip_id', name='uq_trip_reconciliation'),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+
+    trip_id: Mapped[int] = mapped_column(
+        ForeignKey("curb_trips.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
+    )
+    recon_stat: Mapped[int] = mapped_column(nullable=False, index=True)
+    
+    reconciled_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), index=True
+    )
+    reconciled_by: Mapped[str] = mapped_column(String(64), default="SYSTEM")
+
+    trip: Mapped["CURBTrip"] = relationship("CURBTrip", back_populates="reconciliation")
+
+    def __repr__(self) -> str:
+        return f"<CURBTripReconciliation(id={self.id}, trip_id={self.trip_id}, recon_stat={self.recon_stat})>"
+    
+
