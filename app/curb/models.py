@@ -101,7 +101,7 @@ class CURBTrip(Base, AuditMixin):
     )
 
     import_log: Mapped["CURBImportLog"] = relationship("CURBImportLog", back_populates="trips")
-    reconcilation: Mapped[Optional["CURBTripReconciliation"]] = relationship(
+    reconciliation: Mapped[Optional["CURBTripReconciliation"]] = relationship(
         "CURBTripReconciliation", back_populates="trip", uselist=False
     )
     driver: Mapped[Optional["Driver"]] = relationship("Driver", foreign_keys=[driver_fk])

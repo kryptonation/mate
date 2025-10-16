@@ -20,7 +20,6 @@ from app.utils.logger import get_logger
 from app.users.utils import get_current_user
 from app.users.models import User
 from app.drivers.services import driver_service
-from app.curb.services import curb_service
 from app.audit_trail.services import audit_trail_service
 from app.drivers.utils import format_driver_response
 from app.drivers.search_service import (
@@ -171,8 +170,8 @@ def view_driver_details(
 
         lease_drivers = lease_service.get_lease_drivers(db=db , driver_id=driver_id , multiple=True)
         leases = [driver.lease.to_dict() for driver in lease_drivers] if lease_drivers else []
-        trips = curb_service.get_curb_trip(db=db , driver_id=driver.driver_id ,start_date_from = trip_start_date , end_date_to= trip_end_date , multiple=True)
-        revenue = curb_service.get_curb_revenue(db=db , driver_id=driver.driver_id ,start_date=trip_start_date , end_date= trip_end_date) if trip_start_date and trip_end_date else 0.0
+        trips = []
+        revenue = 0.0
         documents = upload_service.get_documents(db=db , object_type="driver" , object_id=driver.id , multiple=True)
         driver_history = audit_trail_service.get_related_audit_trail(db=db , driver_id=driver.id)
         ledgers = ledger_service.get_ledger_entries(db=db , driver_id=driver.id , multiple=True)

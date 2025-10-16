@@ -39,24 +39,28 @@ worker_disable_rate_limits = False
 # Beat schedule configuration
 # This defines when periodic tasks should run
 beat_schedule = {
-    # CURB trip processing - run every 24 hours at 2 AM UTC
-    "curb-trip-processing": {
-        "task": "app.curb.tasks.fetch_and_reconcile_curb_trips",
-        "schedule": crontab(hour=6, minute=0),  # Run daily at 6 AM UTC
+    # Fetch and import CURB trips every 24 hours at 2 AM
+    "curb-fetch-and-import": {
+        "task": "app.curb.tasks.fetch_and_import_curb_trips",
+        "schedule": crontab(hour=2, minute=0),  # Daily at 2 AM UTC
         "options": {
             "timezone": "America/New_York"
         }
     },
-    "curb-trip-reconciliation": {
-        "task": "app.curb.tasks.reconcile_curb_trips_only",
-        "schedule": crontab(hour=7, minute=0),  # Run daily at 7 AM UTC
+    
+    # Reconcile CURB trips every 24 hours at 3 AM
+    "curb-reconcile": {
+        "task": "app.curb.tasks.reconcile_curb_trips",
+        "schedule": crontab(hour=3, minute=0),  # Daily at 3 AM UTC
         "options": {
             "timezone": "America/New_York"
         }
     },
-    "curb-trip-posting": {
-        "task": "app.curb.tasks.post_curb_trips_only",
-        "schedule": crontab(hour=8, minute=0),  # Run daily at 8 AM UTC
+    
+    # Post CURB trips to ledger every 24 hours at 4 AM
+    "curb-post": {
+        "task": "app.curb.tasks.post_curb_trips",
+        "schedule": crontab(hour=4, minute=0),  # Daily at 4 AM UTC
         "options": {
             "timezone": "America/New_York"
         }
@@ -68,36 +72,6 @@ beat_schedule = {
             "timezone": "America/New_York"
         }
     },
-    
-    # Periodic reports tasks
-    "scheduled-reports": {
-        "task": "app.periodic_reports.tasks.scheduled_reports_task",
-        "schedule": crontab(minute="*/15"),  # Check every 15 minutes for scheduled reports
-        "options": {
-            "timezone": "UTC"
-        }
-    },
-    "cleanup-old-reports": {
-        "task": "app.periodic_reports.tasks.cleanup_old_reports_task",
-        "schedule": crontab(hour=2, minute=0),  # Daily at 2 AM UTC
-        "options": {
-            "timezone": "UTC"
-        }
-    },
-    "weekly-summary": {
-        "task": "app.periodic_reports.tasks.send_weekly_summary_task",
-        "schedule": crontab(hour=9, minute=0, day_of_week="mon"),  # Weekly on Monday at 9 AM UTC
-        "options": {
-            "timezone": "UTC"
-        }
-    },
-    
-    # Sample task schedule
-    # "sample-task": {
-    #     "task": "app.worker.tasks.sample_task",
-    #     "schedule": crontab(minute="*/1"), # Run every minute
-    #     "args": (16, 16)
-    # }
 }
 
 # Worker configuration

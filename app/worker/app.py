@@ -22,7 +22,6 @@ app.autodiscover_tasks([
     "app.worker",
     "app.curb",
     "app.ledger",
-    "app.periodic_reports"
 ])
 
 if __name__ == "__main__":

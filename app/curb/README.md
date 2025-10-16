@@ -1,268 +1,617 @@
-# CURB Trip Processing System
+# CURB (Taxi Fleet) Module - Updated
 
-This module handles the automated processing of CURB (taxi meter) trip data, including fetching trips from the CURB API, importing them into the database, reconciling them locally, and posting them to ledgers.
+This module handles the automated processing of CURB taxi meter trip data using modern async patterns, SQLAlchemy 2.x, and proper dependency injection.
 
 ## Overview
 
 The CURB system processes taxi trip data through the following workflow:
 
-1. **Fetch**: Retrieve trip data from the CURB API for the last 24 hours
-2. **Import**: Store new trips in the database, avoiding duplicates
-3. **Reconcile**: Mark trips as reconciled locally in your database (no remote API calls)
-4. **Post**: Associate trips with leases and create ledger entries
+1. **Fetch & Import**: Retrieve trip data from the CURB SOAP API and import into database
+2. **Reconcile**: Mark trips as reconciled (locally for dev/uat, on server for production)
+3. **Associate**: Link trips with active leases
+4. **Post**: Create ledger entries for trips
 
 ## Architecture
 
-### Models
+### Technology Stack
 
-- `CURBTrip`: Main trip data model
-- `CURBImportLog`: Tracks import operations
-- `CURBTripReconcilation`: Tracks reconciliation operations
+- **SQLAlchemy 2.x**: ORM with async support
+- **FastAPI**: Async REST API endpoints
+- **Celery**: Task queue for automated processing
+- **Redis**: Message broker and result backend
+- **HTTPX**: Async HTTP client for SOAP API calls
+- **Pydantic**: Schema validation
 
-### Services
+### Module Structure
 
-- `CURBService`: Main service class handling all CURB operations
-- `curb_service`: Singleton instance of the service
+```
+app/curb/
+├── __init__.py              # Module exports
+├── models.py                # SQLAlchemy 2.x models
+├── schemas.py               # Pydantic schemas
+├── repository.py            # Data access layer (async)
+├── services.py              # Business logic layer (async)
+├── router.py                # FastAPI endpoints (async)
+├── tasks.py                 # Celery tasks
+├── soap_client.py           # Async SOAP client
+├── utils.py                 # XML parsing utilities
+├── exceptions.py            # Custom exceptions
+└── README.md                # This file
+```
 
-### Tasks
+### Design Patterns
 
-- `fetch_and_reconcile_curb_trips`: Main task that runs every 24 hours
-- `reconcile_curb_trips_only`: Task to reconcile existing trips only
-- `post_curb_trips_only`: Task to post reconciled trips to ledgers only
+- **Repository Pattern**: Data access abstraction
+- **Service Layer**: Business logic separation
+- **Dependency Injection**: Clean dependencies between layers
+- **Async/Await**: Non-blocking I/O operations
+- **Task Queue**: Background job processing
+
+## Models
+
+### CURBTrip
+
+Main trip data model with comprehensive fields:
+
+**Identifiers:**
+- `id`: Primary key
+- `record_id`: CURB record identifier (unique with period)
+- `period`: Trip period (YYYYMM format)
+- `trip_number`: Service number
+
+**Vehicle & Driver:**
+- `cab_number`: Vehicle medallion/plate number
+- `driver_id`: Driver identifier
+- `driver_fk`, `medallion_fk`, `vehicle_fk`: Foreign keys for associations
+
+**Timing:**
+- `start_date`, `end_date`: Trip dates
+- `start_time`, `end_time`: Trip times
+
+**Fare Breakdown:**
+- `trip_amount`: Base fare
+- `tips`: Tip amount
+- `extras`: Extra charges
+- `tolls`: Toll charges
+- `tax`: State tax
+- `imp_tax`: Improvement surcharge
+- `total_amount`: Total fare
+
+**Fees:**
+- `ehail_fee`: E-hail service fee
+- `health_fee`: Health surcharge
+- `congestion_fee`: Congestion pricing
+- `airport_fee`: Airport pickup/dropoff fee
+- `cbdt_fee`: Congestion relief zone toll
+
+**Location:**
+- `gps_start_lat`, `gps_start_lon`: Start coordinates
+- `gps_end_lat`, `gps_end_lon`: End coordinates
+- `from_address`, `to_address`: Address strings
+
+**Payment:**
+- `payment_type`: T=Cash, P=Private, C=Credit Card
+- `cc_number`: Masked card number
+- `auth_code`: Authorization code
+- `auth_amount`: Authorized amount
+
+**Status:**
+- `is_reconciled`: Reconciliation status
+- `is_posted`: Posting status
+- `recon_stat`: Reconciliation receipt number
+- `status`: Current status (Imported/Reconciled/Posted/Failed)
+- `associate_failed_reason`: Association failure reason
+- `post_failed_reason`: Posting failure reason
+
+**Metadata:**
+- `passengers`: Number of passengers
+- `distance_service`: Distance in service (miles)
+- `distance_bs`: Dead head distance
+- `reservation_number`: Reservation ID
+- `import_id`: Reference to import log
+
+### CURBImportLog
+
+Tracks import operations:
+
+- `id`: Primary key
+- `import_source`: Source (SOAP/Upload/Manual)
+- `imported_by`: User or system
+- `import_start`, `import_end`: Timestamps
+- `total_records`: Total processed
+- `success_count`: Successfully imported
+- `failure_count`: Failed imports
+- `duplicate_count`: Duplicates skipped
+- `status`: IN_PROGRESS/COMPLETED/FAILED/PARTIAL
+- `error_summary`: Error details
+
+### CURBTripReconciliation
+
+Tracks reconciliation operations:
+
+- `id`: Primary key
+- `trip_id`: Reference to CURBTrip (unique)
+- `recon_stat`: Reconciliation receipt number
+- `reconciled_at`: Timestamp
+- `reconciled_by`: User or system
+- `reconciliation_type`: LOCAL or REMOTE
+
+## API Endpoints
+
+### Trip Operations
+
+**List Trips**
+```
+GET /curb/trips
+Query Parameters:
+  - trip_id: Filter by trip ID
+  - record_id: Filter by record ID
+  - period: Filter by period
+  - driver_id: Comma-separated driver IDs
+  - cab_number: Comma-separated cab numbers
+  - start_date_from, start_date_to: Date range
+  - payment_type: T, P, or C
+  - is_reconciled: Boolean
+  - is_posted: Boolean
+  - status: Comma-separated statuses
+  - page, per_page: Pagination
+  - sort_by, sort_order: Sorting
+```
+
+**Get Trip**
+```
+GET /curb/trips/{trip_id}
+```
+
+**Update Trip**
+```
+PATCH /curb/trips/{trip_id}
+Body: CURBTripUpdate schema
+```
+
+**Export Trips**
+```
+GET /curb/trips/export/{format}
+Formats: excel, pdf
+Query Parameters: Same as list trips
+```
+
+### Import Operations
+
+**Import Trips**
+```
+POST /curb/import
+Query Parameters:
+  - from_date: MM/DD/YYYY
+  - to_date: MM/DD/YYYY
+  - driver_id: Optional filter
+  - cab_number: Optional filter
+  - recon_stat: Reconciliation filter
+```
+
+### Reconciliation Operations
+
+**Reconcile Trips**
+```
+POST /curb/reconcile
+Query Parameters:
+  - trip_ids: List of trip IDs
+  - recon_stat: Optional receipt number
+Environment-aware:
+  - Production: Calls CURB API
+  - Dev/UAT: Local reconciliation only
+```
+
+### Posting Operations
+
+**Post Trips**
+```
+POST /curb/post
+Posts all reconciled but unposted trips to ledger
+```
+
+### Log Operations
+
+**List Import Logs**
+```
+GET /curb/logs
+Query Parameters:
+  - log_id, import_source, imported_by
+  - import_start_from, import_start_to
+  - status
+  - page, per_page, sort_by, sort_order
+```
+
+**Get Import Log**
+```
+GET /curb/logs/{log_id}
+```
+
+## Celery Tasks
+
+### Scheduled Tasks
+
+All tasks are configured in `app/worker/config.py`:
+
+**fetch_and_import_curb_trips**
+- Schedule: Daily at 2 AM
+- Fetches trips from last 24 hours
+- Imports new trips into database
+- No reconciliation or posting
+
+**reconcile_curb_trips**
+- Schedule: Daily at 3 AM
+- Reconciles unreconciled trips
+- Environment-aware (local vs server)
+
+**post_curb_trips**
+- Schedule: Daily at 4 AM
+- Posts reconciled trips to ledger
+- Associates with active leases
+
+**process_curb_trips_full**
+- Not scheduled by default
+- Runs complete workflow (fetch → reconcile → post)
+- Useful for manual processing
+
+**manual_fetch_curb_trips**
+- Not scheduled
+- Fetches trips for custom date range
+- Useful for backfilling data
+
+### Task Execution
+
+```python
+from app.curb.tasks import fetch_and_import_curb_trips, reconcile_curb_trips
+
+# Run async (queued)
+result = fetch_and_import_curb_trips.delay()
+
+# Run sync (immediate)
+result = fetch_and_import_curb_trips.apply()
+
+# Get result
+data = result.get()
+```
 
 ## Configuration
 
 ### Environment Variables
 
-The following environment variables must be set in your `.env` file:
+Required environment variables in `.env`:
 
 ```env
 # CURB API Configuration
-CURB_URL=https://api.curb.com/soap
+CURB_URL=https://api.taxitronic.org/vts_service/taxi_service.asmx
 CURB_MERCHANT=your_merchant_id
 CURB_USERNAME=your_username
 CURB_PASSWORD=your_password
 
-# Redis Configuration (for Celery)
+# Environment (affects reconciliation behavior)
+ENVIRONMENT=development  # development, uat, or production
+
+# Database (async SQLAlchemy)
+DATABASE_URL=postgresql+asyncpg://user:pass@host/db
+
+# Redis (Celery)
 REDIS_HOST=localhost
 REDIS_PORT=6379
 REDIS_USERNAME=
 REDIS_PASSWORD=
 ```
 
-### Celery Configuration
+### Reconciliation Behavior
 
-The CURB tasks are configured to run automatically via Celery Beat:
+The module has environment-aware reconciliation:
 
-- **Main Task**: `fetch_and_reconcile_curb_trips` runs every 24 hours at 2 AM UTC
-- **Worker**: Uses Redis as broker and result backend
-- **Concurrency**: Configurable via worker settings
+**Development / UAT:**
+- Reconciliation is LOCAL only
+- No CURB API calls made
+- Trips marked as reconciled in local database
+- Useful for testing without affecting production data
 
-## Usage
+**Production:**
+- Reconciliation calls CURB API
+- Trips marked as reconciled on CURB server
+- Local database updated after successful API call
+- Receipt numbers (recon_stat) must be unique
 
-### Automatic Execution
+## Usage Examples
 
-The main task runs automatically every 24 hours. To start the automated processing:
+### Starting Workers
 
-1. Start the Celery worker:
-   ```bash
-   celery -A app.core.celery_app worker --loglevel=info
-   ```
+```bash
+# Start Celery worker
+celery -A app.core.celery_app worker --loglevel=info
 
-2. Start the Celery beat scheduler:
-   ```bash
-   celery -A app.core.celery_app beat --loglevel=info
-   ```
-
-### Manual Execution
-
-You can also run tasks manually:
-
-```python
-from app.curb.tasks import fetch_and_reconcile_curb_trips
-
-# Run the main task
-result = fetch_and_reconcile_curb_trips.delay()
-
-# Check the result
-print(result.get())
+# Start Celery beat (scheduler)
+celery -A app.core.celery_app beat --loglevel=info
 ```
 
-### Individual Tasks
+### Manual Import via API
 
 ```python
-from app.curb.tasks import reconcile_curb_trips_only, post_curb_trips_only
+import httpx
 
-# Reconcile trips only
-reconcile_curb_trips_only.delay()
-
-# Post trips only
-post_curb_trips_only.delay()
-
-# Reconcile with specific receipt number
-reconcile_curb_trips_only.delay(recon_stat=12345)
+# Import trips
+response = httpx.post(
+    "http://localhost:8000/curb/import",
+    params={
+        "from_date": "01/01/2025",
+        "to_date": "01/31/2025"
+    },
+    headers={"Authorization": "Bearer <token>"}
+)
+result = response.json()
+print(f"Imported {result['success_count']} trips")
 ```
 
-## Task Details
+### Manual Task Execution
 
-### fetch_and_reconcile_curb_trips
+```python
+from app.curb.tasks import manual_fetch_curb_trips
 
-**Purpose**: Main task that orchestrates the entire CURB processing workflow.
+# Fetch specific date range
+result = manual_fetch_curb_trips.delay(
+    from_date="01/01/2025",
+    to_date="01/31/2025",
+    driver_id="DRV123",
+    import_by="admin"
+)
 
-**Schedule**: Runs every 24 hours at 2 AM UTC
+# Wait for completion
+data = result.get(timeout=300)
+print(data)
+```
 
-**Process**:
-1. Fetches trips from CURB API for the last 24 hours
-2. Imports new trips into the database (deduplicates by record_id and period)
-3. Reconciles unreconciled trips with the CURB system
-4. Associates trips with active leases and posts to ledgers
+### Querying Trips
 
-**Returns**: Summary of processing results including import and posting statistics
+```python
+from app.curb.repository import CURBRepository
+from app.curb.schemas import CURBTripFilters
+from app.core.db import get_async_db
 
-### reconcile_curb_trips_only
-
-**Purpose**: Reconcile existing unreconciled trips locally without fetching new data or calling remote API.
-
-**Parameters**:
-- `recon_stat` (Optional[int]): Receipt number for reconciliation. If None, uses timestamp.
-
-**Process**:
-1. Queries for unreconciled trips in local database
-2. Updates trip status as reconciled locally
-3. Creates local reconciliation records
-4. No remote API calls are made
-
-### post_curb_trips_only
-
-**Purpose**: Post already reconciled trips to ledgers without reconciliation.
-
-**Process**:
-1. Queries for reconciled but unposted trips
-2. Associates trips with active leases
-3. Creates ledger entries
-4. Marks trips as posted
-
-## Database Schema
-
-### CURBTrip
-- `id`: Primary key
-- `record_id`: CURB record identifier
-- `period`: Trip period
-- `cab_number`: Vehicle plate number
-- `driver_id`: Driver identifier
-- `start_date`, `end_date`: Trip dates
-- `start_time`, `end_time`: Trip times
-- `total_amount`: Trip total amount
-- `is_reconciled`: Reconciliation status
-- `is_posted`: Posting status
-- `recon_stat`: Reconciliation receipt number
-
-### CURBImportLog
-- `id`: Primary key
-- `imported_by`: User who initiated import
-- `import_start`, `import_end`: Import timestamps
-- `import_source`: Source of import (SOAP, Upload, etc.)
-- `total_records`: Number of records processed
-- `status`: Import status
-
-### CURBTripReconcilation
-- `id`: Primary key
-- `trip_id`: Reference to CURBTrip
-- `recon_stat`: Reconciliation receipt number
-- `reconciled_at`: Reconciliation timestamp
-- `reconciled_by`: User who performed reconciliation
+async def get_unreconciled_trips():
+    async for db in get_async_db():
+        repo = CURBRepository(db)
+        
+        filters = CURBTripFilters(
+            is_reconciled=False,
+            start_date_from=date(2025, 1, 1),
+            page=1,
+            per_page=100
+        )
+        
+        trips, total = await repo.get_trips(filters)
+        print(f"Found {total} unreconciled trips")
+        return trips
+```
 
 ## Error Handling
 
-The tasks include comprehensive error handling:
+### Custom Exceptions
 
-- **Database errors**: Logged and re-raised
-- **API errors**: Logged with full stack traces
-- **Validation errors**: Caught and logged
-- **Network timeouts**: Handled with retry logic
+All operations use custom exceptions from `app/curb/exceptions.py`:
 
-## Monitoring
+- `CURBTripNotFoundException`
+- `CURBImportLogNotFoundException`
+- `CURBFileValidationException`
+- `CURBImportException`
+- `CURBReconciliationException`
+- `CURBAssociationException`
+- `CURBPostingException`
+- `CURBExportException`
+- `CURBUpdateException`
+- `CURBSOAPException`
+- `CURBXMLParseException`
+- `CURBDuplicateTripException`
 
-### Logs
+### Error Logging
 
-All operations are logged with task IDs for tracking:
+All operations include comprehensive logging:
 
-```
-[Task ID: abc123] Starting CURB trip fetch and reconciliation process
-[Task ID: abc123] Retrieved 150 trip records from CURB API
-[Task ID: abc123] Imported 45 new trips, 105 total processed
-[Task ID: abc123] Reconciled 45 trips
-[Task ID: abc123] Posted 40 trips to ledgers
-```
-
-### Metrics
-
-The tasks return detailed metrics:
-
-```json
-{
-  "status": "success",
-  "task_id": "abc123",
-  "import_result": {
-    "inserted": 45,
-    "total": 105
-  },
-  "post_result": {
-    "posted_count": 40,
-    "skipped": [{"trip_id": 123, "reason": "Lease not found"}],
-    "errors": []
-  },
-  "processed_at": "2024-01-15T02:00:00"
-}
+```python
+logger.info("Operation started", param1=value1)
+logger.error("Operation failed", error=str(e), exc_info=True)
 ```
 
 ## Testing
 
-Run the test script to verify the setup:
+### Unit Tests
 
 ```bash
-cd backend/src
-python test_curb_tasks.py
+pytest tests/curb/test_repository.py
+pytest tests/curb/test_services.py
+pytest tests/curb/test_soap_client.py
 ```
 
-This will test:
-- Task imports
-- Celery app configuration
-- Service imports
-- Model imports
+### Integration Tests
+
+```bash
+pytest tests/curb/test_integration.py
+```
+
+### Manual Testing
+
+Use the Swagger UI at `http://localhost:8000/docs` to test API endpoints interactively.
+
+## Monitoring
+
+### Task Monitoring
+
+Use Celery Flower for task monitoring:
+
+```bash
+celery -A app.core.celery_app flower
+```
+
+Access at: `http://localhost:5555`
+
+### Database Queries
+
+```sql
+-- Check import logs
+SELECT * FROM curb_import_logs ORDER BY import_start DESC LIMIT 10;
+
+-- Check trip statistics
+SELECT 
+    status,
+    COUNT(*) as count,
+    SUM(total_amount) as total_revenue
+FROM curb_trips
+WHERE start_date >= CURRENT_DATE - INTERVAL '7 days'
+GROUP BY status;
+
+-- Check reconciliation status
+SELECT 
+    is_reconciled,
+    is_posted,
+    COUNT(*) as count
+FROM curb_trips
+GROUP BY is_reconciled, is_posted;
+```
+
+## Migration from Old Module
+
+If migrating from the old synchronous CURB module:
+
+1. **Update imports**:
+   ```python
+   # Old
+   from app.curb.services import curb_service
+   
+   # New
+   from app.curb.services import CURBService
+   from app.curb.repository import CURBRepository
+   ```
+
+2. **Update to async**:
+   ```python
+   # Old (sync)
+   def process_trips():
+       result = curb_service.import_curb_trips(db, xml_data)
+   
+   # New (async)
+   async def process_trips():
+       async for db in get_async_db():
+           repo = CURBRepository(db)
+           service = CURBService(repo)
+           result = await service.import_trips(xml_data)
+   ```
+
+3. **Update task names**:
+   ```python
+   # Old
+   from app.curb.tasks import fetch_and_reconcile_curb_trips
+   
+   # New
+   from app.curb.tasks import fetch_and_import_curb_trips, reconcile_curb_trips
+   ```
+
+4. **Update Celery schedule** in `app/worker/config.py`
+
+5. **Run database migrations** to update schema
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **Task not running**: Check Celery worker and beat are running
-2. **API errors**: Verify CURB credentials in environment variables
-3. **Database errors**: Check database connection and permissions
-4. **Import failures**: Check for duplicate records or validation errors
+**Issue: Tasks not running**
+- Check Celery worker and beat are running
+- Verify Redis connection
+- Check task names in beat schedule
+
+**Issue: SOAP API errors**
+- Verify CURB credentials in `.env`
+- Check API URL and network connectivity
+- Review SOAP client logs for details
+
+**Issue: Database errors**
+- Check async database connection string
+- Verify SQLAlchemy 2.x compatibility
+- Review migration status
+
+**Issue: Import failures**
+- Check for duplicate records
+- Verify XML parsing
+- Review import log error_summary
+
+**Issue: Reconciliation failures**
+- Check environment variable (dev vs production)
+- Verify CURB API access (production only)
+- Review trip status before reconciliation
 
 ### Debug Mode
 
-To run tasks in debug mode:
+Enable debug logging in `.env`:
+
+```env
+LOG_LEVEL=DEBUG
+```
+
+Run tasks synchronously for debugging:
 
 ```python
-from app.curb.tasks import fetch_and_reconcile_curb_trips
+from app.curb.tasks import fetch_and_import_curb_trips
 
-# Run synchronously for debugging
-result = fetch_and_reconcile_curb_trips.apply()
+result = fetch_and_import_curb_trips.apply()
 print(result.get())
 ```
 
-## Dependencies
+## Performance Optimization
 
-- `celery`: Task queue framework
-- `redis`: Message broker and result backend
-- `sqlalchemy`: Database ORM
-- `requests`: HTTP client for CURB API
-- `lxml`: XML parsing for SOAP responses
+### Bulk Operations
+
+The module uses bulk operations for efficiency:
+
+- `bulk_create_trips()`: Insert multiple trips in one transaction
+- `bulk_create_reconciliations()`: Create multiple reconciliation records
+
+### Database Indexes
+
+Optimized indexes on:
+- `record_id`, `period` (composite for uniqueness)
+- `start_date`, `end_date` (date range queries)
+- `cab_number`, `driver_id` (filtering)
+- `is_reconciled`, `is_posted` (status queries)
+
+### Connection Pooling
+
+Async SQLAlchemy uses connection pooling by default. Configure in `app/core/db.py`:
+
+```python
+engine = create_async_engine(
+    DATABASE_URL,
+    pool_size=20,
+    max_overflow=0
+)
+```
 
 ## Security
 
-- CURB credentials are stored in environment variables
-- Database connections use connection pooling
-- All API calls include timeout handling
-- Error messages don't expose sensitive information 
+- **API Authentication**: All endpoints require authentication
+- **Environment Variables**: Sensitive data not in code
+- **SQL Injection Protection**: Parameterized queries via SQLAlchemy
+- **Input Validation**: Pydantic schemas validate all inputs
+- **Error Handling**: No sensitive data in error messages
+
+## Contributing
+
+When adding new features:
+
+1. Follow the existing patterns (models → repository → services → router)
+2. Use async/await consistently
+3. Add type hints to all functions
+4. Write comprehensive docstrings
+5. Add logging for important operations
+6. Include error handling with custom exceptions
+7. Update schemas for API changes
+8. Write tests for new functionality
+9. Update this README
+
+## References
+
+- [CURB API Documentation](./CURB_API_Documentation.pdf)
+- [SQLAlchemy 2.x Documentation](https://docs.sqlalchemy.org/en/20/)
+- [FastAPI Documentation](https://fastapi.tiangolo.com/)
+- [Celery Documentation](https://docs.celeryproject.org/)

@@ -1,175 +1,457 @@
-## app/curb/tasks.py
+# app/curb/tasks.py
 
-# Standard library imports
-from datetime import datetime, timedelta
+"""
+Celery tasks for CURB (Taxi Fleet) operations
+
+This module contains all Celery tasks for automated CURB trip processing.
+Tasks are scheduled via Celery Beat and can also be triggered manually.
+"""
+
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-# Third party imports
 from celery import shared_task
 
-# Local imports
 from app.utils.logger import get_logger
-from app.core.db import get_db
-from app.curb.soap_client import fetch_trips_log10
-from app.curb.services import curb_service
+from app.core.db import get_async_db
+from app.core.config import settings
+from app.curb.soap_client import fetch_trips_log10, fetch_trans_by_date_cab12
+from app.curb.services import CURBService
+from app.curb.repository import CURBRepository
 
 logger = get_logger(__name__)
 
-@shared_task(bind=True, name='app.curb.tasks.fetch_and_reconcile_curb_trips')
-def fetch_and_reconcile_curb_trips(self):
+
+@shared_task(bind=True, name='app.curb.tasks.fetch_and_import_curb_trips')
+def fetch_and_import_curb_trips(self):
     """
-    Fetch curb trips from the CURB API every 24 hours, reconcile them, and post to ledgers.
+    Fetch and import CURB trips from the API for the last 24 hours.
     
-    This task:
-    1. Fetches trips from the last 24 hours from CURB API
-    2. Imports new trips into the database
-    3. Reconciles trips with CURB system
-    4. Associates trips with leases and posts to ledgers
+    This task runs every 24 hours and:
+    1. Fetches card transactions from the last 24 hours
+    2. Fetches cash trips from the last 24 hours
+    3. Imports new trips into the database
+    
+    Note: This task only imports trips. Reconciliation and posting are separate tasks.
     """
     task_id = self.request.id
-    logger.info("[Task ID: %s] Starting CURB trip fetch and reconciliation process", task_id)
+    logger.info("[Task ID: %s] Starting CURB trip fetch and import", task_id)
 
     try:
-        # Get database session
-        db = next(get_db())
-        logger.info("[Task ID: %s] Database connection established", task_id)
-        
-        # Step 1: Fetch trips from the last 24 hours
-        from_date = datetime.now() - timedelta(days=1)
-        to_date = datetime.now()
+        # Calculate date range (last 24 hours)
+        to_date = datetime.now(timezone.utc)
+        from_date = to_date - timedelta(days=1)
 
-        logger.info("[Task ID: %s] Fetching trips from %s to %s", task_id, from_date.strftime('%m/%d/%Y'), to_date.strftime('%m/%d/%Y'))
+        from_date_str = from_date.strftime('%m/%d/%Y')
+        to_date_str = to_date.strftime('%m/%d/%Y')
 
-        trip_records = fetch_trips_log10(
-            from_date=from_date.strftime('%m/%d/%Y'), 
-            to_date=to_date.strftime('%m/%d/%Y')
+        logger.info(
+            "[Task ID: %s] Fetching trips from %s to %s",
+            task_id, from_date_str, to_date_str
         )
 
-        logger.debug("[Task ID: %s] Retrieved trip: %s", task_id, trip_records)
-        logger.info("[Task ID: %s] Retrieved %d trip records from CURB API", task_id, len(trip_records) if trip_records else 0)
+        # Fetch card transactions
+        try:
+            card_xml = fetch_trans_by_date_cab12(
+                from_datetime=from_date_str,
+                to_datetime=to_date_str,
+                cab_number="",
+                tran_type="ALL"
+            )
+            logger.info("[Task ID: %s] Card transactions fetched", task_id)
+        except Exception as e:
+            logger.error(
+                "[Task ID: %s] Failed to fetch card transactions: %s",
+                task_id, str(e), exc_info=True
+            )
+            card_xml = ""
 
-        # Step 2: Import trips into database
-        if trip_records:
-            import_result = curb_service.import_curb_trips(db, trip_records)
-            logger.info("[Task ID: %s] Imported %d new trips, %d total processed", task_id, import_result.get('inserted', 0), import_result.get('total', 0))
-        else:
-            logger.info("[Task ID: %s] No new trips to import", task_id)
-            import_result = {"inserted": 0, "total": 0}
+        # Fetch cash trips
+        try:
+            cash_xml = fetch_trips_log10(
+                from_date=from_date_str,
+                to_date=to_date_str,
+                recon_stat=-1,  # Get all trips
+                cab_number="",
+                driver_id=""
+            )
+            logger.info("[Task ID: %s] Cash trips fetched", task_id)
+        except Exception as e:
+            logger.error(
+                "[Task ID: %s] Failed to fetch cash trips: %s",
+                task_id, str(e), exc_info=True
+            )
+            cash_xml = ""
+
+        if not card_xml and not cash_xml:
+            logger.warning("[Task ID: %s] No trip data retrieved", task_id)
+            return {
+                "status": "no_data",
+                "task_id": task_id,
+                "message": "No trip data available for the specified period"
+            }
+
+        # Import trips using async service
+        import asyncio
         
-        # Step 3: Reconcile trips locally (only if we have new trips)
-        if import_result.get('inserted', 0) > 0:
-            logger.info("[Task ID: %s] Starting local reconciliation of unreconciled trips", task_id)
+        async def import_trips_async():
+            async for db in get_async_db():
+                try:
+                    repo = CURBRepository(db)
+                    service = CURBService(repo)
+                    
+                    result = await service.import_trips(
+                        xml_data=card_xml,
+                        cash_xml_data=cash_xml,
+                        import_source="SOAP",
+                        import_by="SYSTEM"
+                    )
+                    
+                    return result
+                finally:
+                    await db.close()
 
-            # Use the bulk local reconciliation method
-            reconcile_result = curb_service.bulk_reconcile_trips_locally(db)
-            
-            logger.info("[Task ID: %s] Locally reconciled %d trips", task_id, reconcile_result.get('reconciled_count', 0))
-        else:
-            logger.info("[Task ID: %s] Skipping reconciliation - no new trips", task_id)
+        import_result = asyncio.run(import_trips_async())
 
-        # Step 4: Bulk associate and post trips to ledgers
-        logger.info("[Task ID: %s] Starting bulk association and posting to ledgers", task_id)
-        post_result = curb_service.bulk_associate_and_post_trips(db)
+        logger.info(
+            "[Task ID: %s] Import completed: %d total, %d imported, %d duplicates",
+            task_id,
+            import_result.total_records,
+            import_result.success_count,
+            import_result.duplicate_count
+        )
 
-        logger.info("[Task ID: %s] Posted %d trips to ledgers", task_id, post_result.get('posted_count', 0))
-        if post_result.get('skipped'):
-            logger.info("[Task ID: %s] Skipped %d trips", task_id, len(post_result['skipped']))
-        if post_result.get('errors'):
-            logger.warning("[Task ID: %s] Errors occurred: %s", task_id, post_result['errors'])
-
-        # Return summary
-        result = {
+        return {
             "status": "success",
             "task_id": task_id,
-            "import_result": import_result,
-            "post_result": post_result,
-            "processed_at": datetime.now().isoformat()
+            "import_result": {
+                "log_id": import_result.log_id,
+                "total_records": import_result.total_records,
+                "success_count": import_result.success_count,
+                "duplicate_count": import_result.duplicate_count,
+                "failure_count": import_result.failure_count,
+            },
+            "processed_at": datetime.now(timezone.utc).isoformat()
         }
-        
-        logger.info("[Task ID: %s] CURB trip processing completed successfully", task_id)
-        return result
-        
-    except Exception as e:
-        logger.error("[Task ID: %s] Error in CURB trip processing: %s", task_id, str(e), exc_info=True)
-        # Re-raise the exception so Celery can handle it properly
-        raise
-    finally:
-        try:
-            db.close()
-            logger.info("[Task ID: %s] Database session closed", task_id)
-        except Exception as e:
-            logger.error("[Task ID: %s] Error closing database session: %s", task_id, str(e), exc_info=True)
 
-@shared_task(bind=True, name='app.curb.tasks.reconcile_curb_trips_only')
-def reconcile_curb_trips_only(self, recon_stat: Optional[int] = None):
+    except Exception as e:
+        logger.error(
+            "[Task ID: %s] Error in CURB trip fetch and import: %s",
+            task_id, str(e), exc_info=True
+        )
+        raise
+
+
+@shared_task(bind=True, name='app.curb.tasks.reconcile_curb_trips')
+def reconcile_curb_trips(self, recon_stat: Optional[int] = None):
     """
-    Reconcile existing unreconciled CURB trips locally only.
+    Reconcile unreconciled CURB trips.
+    
+    For dev/uat: reconciles locally without calling CURB API.
+    For production: calls CURB API to reconcile on server.
     
     Args:
-        recon_stat: Receipt number for reconciliation. If None, uses timestamp.
+        recon_stat: Optional reconciliation receipt number.
+                   If None, generates timestamp-based number.
     """
     task_id = self.request.id
-    logger.info("[Task ID: %s] Starting CURB trip local reconciliation only", task_id)
+    logger.info("[Task ID: %s] Starting CURB trip reconciliation", task_id)
+
+    try:
+        # Determine environment
+        is_production = settings.environment.lower() == "production"
+        
+        logger.info(
+            "[Task ID: %s] Reconciliation mode: %s",
+            task_id, "PRODUCTION (server)" if is_production else "DEV/UAT (local)"
+        )
+
+        # Reconcile trips using async service
+        import asyncio
+        
+        async def reconcile_trips_async():
+            async for db in get_async_db():
+                try:
+                    repo = CURBRepository(db)
+                    service = CURBService(repo)
+                    
+                    if is_production:
+                        # Production: Get unreconciled trips and reconcile on server
+                        trips = await repo.get_unreconciled_trips(limit=1000)
+                        
+                        if not trips:
+                            logger.info("[Task ID: %s] No trips to reconcile", task_id)
+                            return None
+                        
+                        trip_ids = [trip.id for trip in trips]
+                        recon_stat_value = recon_stat or int(datetime.now(timezone.utc).timestamp())
+                        
+                        result = await service.reconcile_trips_on_server(
+                            trip_ids=trip_ids,
+                            recon_stat=recon_stat_value,
+                            recon_by="SYSTEM"
+                        )
+                    else:
+                        # Dev/UAT: Reconcile locally
+                        result = await service.reconcile_trips_locally(
+                            trip_ids=None,  # Process all unreconciled
+                            recon_stat=recon_stat,
+                            recon_by="SYSTEM"
+                        )
+                    
+                    return result
+                finally:
+                    await db.close()
+
+        reconcile_result = asyncio.run(reconcile_trips_async())
+
+        if not reconcile_result:
+            return {
+                "status": "no_trips",
+                "task_id": task_id,
+                "message": "No trips to reconcile"
+            }
+
+        logger.info(
+            "[Task ID: %s] Reconciliation completed: %d reconciled",
+            task_id, reconcile_result.reconciled_count
+        )
+
+        return {
+            "status": "success",
+            "task_id": task_id,
+            "reconcile_result": {
+                "total_processed": reconcile_result.total_processed,
+                "reconciled_count": reconcile_result.reconciled_count,
+                "already_reconciled_count": reconcile_result.already_reconciled_count,
+                "failed_count": reconcile_result.failed_count,
+                "recon_stat": reconcile_result.recon_stat,
+            },
+            "processed_at": datetime.now(timezone.utc).isoformat()
+        }
+
+    except Exception as e:
+        logger.error(
+            "[Task ID: %s] Error in CURB trip reconciliation: %s",
+            task_id, str(e), exc_info=True
+        )
+        raise
+
+
+@shared_task(bind=True, name='app.curb.tasks.post_curb_trips')
+def post_curb_trips(self):
+    """
+    Post reconciled CURB trips to ledger.
     
-    try:
-        db = next(get_db())
-        
-        # Check if we have a specific recon_stat or should generate one
-        if recon_stat is None:
-            # Use bulk reconciliation which generates its own recon_stat
-            result = curb_service.bulk_reconcile_trips_locally(db)
-        else:
-            # Get unreconciled trips for specific recon_stat reconciliation
-            unreconciled_trips = curb_service.get_curb_trip(
-                db, is_reconciled=False, multiple=True
-            )
-            
-            if not unreconciled_trips:
-                logger.info("[Task ID: %s] No unreconciled trips found", task_id)
-                return {"status": "success", "message": "No trips to reconcile"}
-            
-            # Convert trip IDs to strings as required by the service method
-            trip_ids = [str(trip.id) for trip in unreconciled_trips]
-            
-            logger.info("[Task ID: %s] Reconciling %s trips locally with recon_stat: %s", task_id, len(trip_ids), recon_stat)
-            
-            result = curb_service.reconcile_curb_trips(db, trip_ids=trip_ids, recon_stat=recon_stat)
-        
-        logger.info("[Task ID: %s] Local reconciliation completed successfully", task_id)
-        return result
-        
-    except Exception as e:
-        logger.error("[Task ID: %s] Error in local reconciliation: %s", task_id, str(e), exc_info=True)
-        raise
-    finally:
-        try:
-            db.close()
-        except Exception as e:
-            logger.error("[Task ID: %s] Error closing database session: %s", task_id, str(e), exc_info=True)
-
-@shared_task(bind=True, name='app.curb.tasks.post_curb_trips_only')
-def post_curb_trips_only(self):
-    """
-    Post already reconciled CURB trips to ledgers only.
+    Processes all reconciled but unposted trips by:
+    1. Associating trips with active leases
+    2. Creating ledger entries
+    3. Marking trips as posted
     """
     task_id = self.request.id
-    logger.info("[Task ID: %s] Starting CURB trip posting only", task_id)
+    logger.info("[Task ID: %s] Starting CURB trip posting", task_id)
 
     try:
-        db = next(get_db())
+        # Post trips using async service
+        import asyncio
         
-        result = curb_service.bulk_associate_and_post_trips(db)
+        async def post_trips_async():
+            async for db in get_async_db():
+                try:
+                    repo = CURBRepository(db)
+                    service = CURBService(repo)
+                    
+                    result = await service.associate_and_post_trips(
+                        posted_by="SYSTEM"
+                    )
+                    
+                    return result
+                finally:
+                    await db.close()
 
-        logger.info("[Task ID: %s] Posting completed successfully", task_id)
-        return result
-        
+        post_result = asyncio.run(post_trips_async())
+
+        logger.info(
+            "[Task ID: %s] Posting completed: %d posted, %d failed, %d skipped",
+            task_id,
+            post_result.posted_count,
+            post_result.failed_count,
+            post_result.skipped_count
+        )
+
+        return {
+            "status": "success",
+            "task_id": task_id,
+            "post_result": {
+                "total_processed": post_result.total_processed,
+                "posted_count": post_result.posted_count,
+                "failed_count": post_result.failed_count,
+                "skipped_count": post_result.skipped_count,
+            },
+            "processed_at": datetime.now(timezone.utc).isoformat()
+        }
+
     except Exception as e:
-        logger.error("[Task ID: %s] Error in posting: %s", task_id, str(e), exc_info=True)
+        logger.error(
+            "[Task ID: %s] Error in CURB trip posting: %s",
+            task_id, str(e), exc_info=True
+        )
         raise
-    finally:
-        try:
-            db.close()
-        except Exception as e:
-            logger.error("[Task ID: %s] Error closing database session: %s", task_id, str(e), exc_info=True)
 
 
+@shared_task(bind=True, name='app.curb.tasks.process_curb_trips_full')
+def process_curb_trips_full(self):
+    """
+    Complete CURB trip processing workflow.
+    
+    This is a convenience task that runs the full workflow:
+    1. Fetch and import trips
+    2. Reconcile trips
+    3. Post trips to ledger
+    
+    This task can be used for manual processing or as an alternative
+    to running individual tasks separately.
+    """
+    task_id = self.request.id
+    logger.info("[Task ID: %s] Starting full CURB trip processing", task_id)
+
+    try:
+        # Step 1: Fetch and import
+        logger.info("[Task ID: %s] Step 1: Fetching and importing trips", task_id)
+        import_result = fetch_and_import_curb_trips.apply()
+        import_data = import_result.get()
+        
+        if import_data.get("status") == "no_data":
+            logger.info("[Task ID: %s] No new trips to process", task_id)
+            return {
+                "status": "no_data",
+                "task_id": task_id,
+                "message": "No new trips to process"
+            }
+
+        # Step 2: Reconcile
+        logger.info("[Task ID: %s] Step 2: Reconciling trips", task_id)
+        reconcile_result = reconcile_curb_trips.apply()
+        reconcile_data = reconcile_result.get()
+
+        # Step 3: Post to ledger
+        logger.info("[Task ID: %s] Step 3: Posting trips to ledger", task_id)
+        post_result = post_curb_trips.apply()
+        post_data = post_result.get()
+
+        logger.info("[Task ID: %s] Full processing completed successfully", task_id)
+
+        return {
+            "status": "success",
+            "task_id": task_id,
+            "import_result": import_data.get("import_result"),
+            "reconcile_result": reconcile_data.get("reconcile_result"),
+            "post_result": post_data.get("post_result"),
+            "processed_at": datetime.now(timezone.utc).isoformat()
+        }
+
+    except Exception as e:
+        logger.error(
+            "[Task ID: %s] Error in full CURB trip processing: %s",
+            task_id, str(e), exc_info=True
+        )
+        raise
+
+
+@shared_task(bind=True, name='app.curb.tasks.manual_fetch_curb_trips')
+def manual_fetch_curb_trips(
+    self,
+    from_date: str,
+    to_date: str,
+    driver_id: Optional[str] = None,
+    cab_number: Optional[str] = None,
+    import_by: str = "MANUAL"
+):
+    """
+    Manually fetch and import CURB trips for a specific date range.
+    
+    This task is useful for:
+    - Backfilling historical data
+    - Reprocessing specific date ranges
+    - Testing with specific drivers or vehicles
+    
+    Args:
+        from_date: Start date in MM/DD/YYYY format
+        to_date: End date in MM/DD/YYYY format
+        driver_id: Optional driver ID filter
+        cab_number: Optional cab number filter
+        import_by: User or system performing import
+    """
+    task_id = self.request.id
+    logger.info(
+        "[Task ID: %s] Manual fetch requested: %s to %s",
+        task_id, from_date, to_date
+    )
+
+    try:
+        # Fetch card transactions
+        card_xml = fetch_trans_by_date_cab12(
+            from_datetime=from_date,
+            to_datetime=to_date,
+            cab_number=cab_number or ""
+        )
+
+        # Fetch cash trips
+        cash_xml = fetch_trips_log10(
+            from_date=from_date,
+            to_date=to_date,
+            recon_stat=-1,
+            cab_number=cab_number or "",
+            driver_id=driver_id or ""
+        )
+
+        if not card_xml and not cash_xml:
+            raise ValueError("No trip data found for the specified date range")
+
+        # Import trips
+        import asyncio
+        
+        async def import_trips_async():
+            async for db in get_async_db():
+                try:
+                    repo = CURBRepository(db)
+                    service = CURBService(repo)
+                    
+                    result = await service.import_trips(
+                        xml_data=card_xml,
+                        cash_xml_data=cash_xml,
+                        import_source="Manual",
+                        import_by=import_by
+                    )
+                    
+                    return result
+                finally:
+                    await db.close()
+
+        import_result = asyncio.run(import_trips_async())
+
+        logger.info(
+            "[Task ID: %s] Manual import completed: %d imported",
+            task_id, import_result.success_count
+        )
+
+        return {
+            "status": "success",
+            "task_id": task_id,
+            "from_date": from_date,
+            "to_date": to_date,
+            "import_result": {
+                "log_id": import_result.log_id,
+                "total_records": import_result.total_records,
+                "success_count": import_result.success_count,
+                "duplicate_count": import_result.duplicate_count,
+            },
+            "processed_at": datetime.now(timezone.utc).isoformat()
+        }
+
+    except Exception as e:
+        logger.error(
+            "[Task ID: %s] Error in manual fetch: %s",
+            task_id, str(e), exc_info=True
+        )
+        raise

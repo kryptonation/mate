@@ -1,735 +1,595 @@
-## app/curb/services.py
+# app/curb/services.py
 
 """
-CURB Services
-
-This module provides services for CURB data operations.
+Business logic layer for CURB (Taxi fleet) operations.
+Implements complete import, association, reconciliation, and posting logic.
 """
-# Standard library imports
-from typing import List, Optional, Union
-from datetime import datetime, timezone, date
-from math import ceil
 
-# Third party imports
-from sqlalchemy.orm import Session 
-from sqlalchemy import String , desc, asc , func
+from datetime import datetime, timezone
+from typing import List, Tuple, Optional
 
+from fastapi import Depends
+from sqlalchemy import select, and_, or_
+from sqlalchemy.ext.asyncio import AsyncSession
 
-# Local imports
-from app.utils.logger import get_logger
-from app.curb.models import CURBTrip, CURBImportLog, CURBTripReconcilation
-from app.ledger.models import LedgerEntry
-from app.medallions.models import Medallion
-from app.drivers.models import Driver , TLCLicense
+from app.core.db import get_async_db
+from app.curb.repository import CURBRepository
+from app.curb.schemas import (
+    CURBTripCreate, CURBTripUpdate, CURBTripFilters,
+    CURBImportLogCreate, CURBImportLogUpdate, CURBImportLogFilters,
+    CURBTripReconciliationCreate,
+    CURBImportResult, CURBReconciliationResult,
+    CURBPostingResult,
+)
+from app.curb.models import CURBTrip, CURBImportLog
+from app.curb.exceptions import (
+    CURBTripNotFoundException, CURBImportLogNotFoundException,
+    CURBImportException, CURBReconciliationException,
+    CURBPostingException, 
+)
 from app.curb.utils import parse_trips_xml, parse_card_transactions_xml
-from app.leases.models import Lease , LeaseDriver
-from app.leases.services import lease_service
-from app.medallions.services import medallion_service
-from app.drivers.services import driver_service
-from app.ledger.models import DailyReceipt
-from app.ledger.schemas import LedgerSourceType
-from app.curb.soap_client import fetch_trips_log10
+from app.curb.soap_client import reconcile_trips_on_server
+
+from app.leases.models import Lease
+from app.medallions.models import Medallion
+from app.ledger.models import LedgerEntry, LedgerSourceType
+
+from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+def get_curb_repository(db: AsyncSession = Depends(get_async_db)) -> CURBRepository:
+    """Get CURB repository"""
+    return CURBRepository(db)
+
 
 class CURBService:
-    """Service for CURB data operations."""
-    def import_curb_trips(
-        self, db: Session, xml_data: str, cash_xml_data: str = None, import_source: str = "SOAP", import_by: str = "SYSTEM"
-    ) -> dict:
-        """Import CURB trips from XML data."""
+    """
+    Business logic layer for CURB operations.
+    Implements complete import, reconciliation, association, and posting workflows.
+    """
+
+    def __init__(self, repo: CURBRepository = Depends(get_curb_repository)):
+        self.repo = repo
+        logger.debug("CURBService initialized")
+
+    # === Trip Operations ===
+
+    async def get_trip_by_id(self, trip_id: int) -> CURBTrip:
+        """Get a single trip by ID"""
+        logger.info("Getting trip by ID", trip_id=trip_id)
+
+        trip = await self.repo.get_trip_by_id(trip_id)
+        if not trip:
+            logger.error("Trip not found", trip_id=trip_id)
+            raise CURBTripNotFoundException(trip_id)
+        
+        return trip
+
+    async def get_trips(
+        self, filters: CURBTripFilters
+    ) -> Tuple[List[CURBTrip], int]:
+        """Get trips with filters and pagination"""
+        logger.info("Getting trips with filters", filters=filters.model_dump())
+
+        trips, total_count = await self.repo.get_trips(filters)
+        logger.info("Retrieved trips", count=len(trips), total=total_count)
+
+        return trips, total_count
+
+    async def update_trip(
+        self, trip_id: int, trip_data: CURBTripUpdate
+    ) -> CURBTrip:
+        """Update a trip"""
+        logger.info("Updating trip", trip_id=trip_id)
+
+        trip = await self.repo.update_trip(trip_id, trip_data)
+        if not trip:
+            raise CURBTripNotFoundException(trip_id)
+
+        logger.info("Trip updated successfully", trip_id=trip_id)
+        return trip
+
+    # === Import Operations ===
+
+    async def import_trips(
+        self, xml_data: str, cash_xml_data: Optional[str] = None,
+        import_source: str = "SOAP", import_by: str = "SYSTEM"
+    ) -> CURBImportResult:
+        """
+        Import trips from XML data
+        
+        Args:
+            xml_data: XML data from card transaction API
+            cash_xml_data: Optional XML data from trips log (cash trips)
+            import_source: Source of import (SOAP, Upload, Manual)
+            import_by: User or system performing import
+
+        Returns:
+            CURBImportResult: Result of the import operation
+        """
+        logger.info("Starting trip import", source=import_source, by=import_by)
+
         try:
-            from app.vehicles.services import vehicle_service
+            # === Parse XML data ===
             trips = parse_card_transactions_xml(xml_data)
+            logger.info("Parsed card transactions", count=len(trips))
+
+            # === Merge cash trips if provided ===
             if cash_xml_data:
                 cash_trips = parse_trips_xml(cash_xml_data)
-                cash_trips = [t for t in cash_trips if t.get("payment_type") == "$"]
-                logger.info(f"*** Found {len(cash_trips)} cash trips to merge")
-                trips = trips + cash_trips
+                cash_only = [t for t in cash_trips if t.get("payment_type") == "$"]
+                trips.extend(cash_only)
+                logger.info("Merged cash trips", count=len(cash_only), total=len(trips))
 
-            # dedup by record_id and period
-            existing_keys = {
-                (r.record_id) for r in db.query(CURBTrip.record_id).all()
-            }
-
-            new_trips = []
-            for t in trips:
-                key = (t.get("curb_record_id", None))
-                if key not in existing_keys:
-
-                    medallion_number_from_curb = t.get("cab_number", None)
-                    plate_number = medallion_number_from_curb
-
-                    if medallion_number_from_curb:
-                        # Find the medallion in the database
-                        medallion = medallion_service.get_medallion(db, medallion_number=medallion_number_from_curb)
-                        if medallion:
-                            # Find the active vehicle associated with this medallion
-                            vehicle = vehicle_service.get_vehicles(db, medallion_id=medallion.id)
-                            if vehicle and vehicle.registrations:
-                                # Find the currently active registration to get the plate number
-                                active_registration = next((reg for reg in vehicle.registrations if reg.is_active), None)
-                                if active_registration and active_registration.plate_number:
-                                    plate_number = active_registration.plate_number
-                                else:
-                                    logger.info(f"Medallion {medallion_number_from_curb} has a vehicle, but no active registration with a plate number was found.")
-                            else:
-                                logger.info(f"No active vehicle is associated with medallion {medallion_number_from_curb} during CURB import.")
-                        else:
-                             logger.info(f"Medallion {medallion_number_from_curb} from CURB data not found in the system.")
-
-                    new_trips.append(CURBTrip(
-                        record_id=t.get("record_id", None),
-                        period=t.get("period", None),
-                        cab_number=plate_number,
-                        driver_id=t.get("driver_id", None),
-                        trip_number=t.get("trip_number", None),
-                        # Separate date and time components
-                        start_date=t.get("start_date"),
-                        start_time=t.get("start_time"),
-                        end_date=t.get("end_date"),
-                        end_time=t.get("end_time"),
-                        # Add other trip data fields
-                        trip_amount=t.get("trip_amount", None),
-                        tips=t.get("tips", None),
-                        extras=t.get("extras", None),
-                        tolls=t.get("tolls", None),
-                        tax=t.get("tax", None),
-                        imp_tax=t.get("imp_tax", None),
-                        total_amount=t.get("total_amount", None),
-                        gps_start_lat=t.get("gps_start_lat", None),
-                        gps_start_lon=t.get("gps_start_lon", None),
-                        gps_end_lat=t.get("gps_end_lat", None),
-                        gps_end_lon=t.get("gps_end_lon", None),
-                        from_address=t.get("from_address", None),
-                        to_address=t.get("to_address", None),
-                        payment_type=t.get("payment_type", None),
-                        cc_number=t.get("cc_number", None),
-                        auth_code=t.get("auth_code", None),
-                        auth_amount=t.get("auth_amount", None),
-                        ehail_fee=t.get("ehail_fee", None),
-                        health_fee=t.get("health_fee", None),
-                        passengers=t.get("passengers", None),
-                        distance_service=t.get("distance_service", None),
-                        distance_bs=t.get("distance_bs", None),
-                        reservation_number=t.get("reservation_number", None),
-                        congestion_fee=t.get("congestion_fee", None),
-                        airport_fee=t.get("airport_fee", None),
-                        cbdt_fee=t.get("cbdt_fee", None)
-                    ))
-
-            logger.info("*** Processing trip: %s", len(new_trips))
-
-            log = CURBImportLog(
+            # === Create import log ===
+            log_data = CURBImportLogCreate(
                 import_source=import_source,
-                imported_by=import_by,
-                total_records=len(new_trips),
-                status="IN_PROGRESS"
+                import_by=import_by,
+                total_records=len(trips),
+                status="IN_PROGRESS",
+            )
+            import_log = await self.repo.create_import_log(log_data)
+            logger.info("Created import log", log_id=import_log.id)
+
+            # === Check for existing trips ===
+            existing_records_ids = set()
+            stmt = select(CURBTrip.record_id).where(
+                CURBTrip.record_id.in_([t["record_id"] for t in trips if "record_id" in t])
+            )
+            result = await self.repo.db.execute(stmt)
+            existing_record_ids = {row[0] for row in result.all()}
+
+            # === Prepare new trips ===
+            new_trips_data = []
+            duplicate_count = 0
+
+            for trip_dict in trips:
+                record_id = trip_dict.get("record_id")
+
+                if record_id in existing_record_ids:
+                    duplicate_count += 1
+                    logger.debug("Duplicate trip skipped", record_id=record_id)
+                    continue
+
+                # === Create trip data ===
+                try:
+                    trip_create = CURBTripCreate(
+                        record_id=record_id,
+                        period=trip_dict.get("period"),
+                        trip_number=trip_dict.get("trip_number"),
+                        cab_number=trip_dict.get("cab_number"),
+                        driver_id=trip_dict.get("driver_id"),
+                        start_date=trip_dict.get("start_date"),
+                        end_date=trip_dict.get("end_date"),
+                        start_time=trip_dict.get("start_time"),
+                        end_time=trip_dict.get("end_time"),
+                        trip_amount=trip_dict.get("trip_amount", 0.0),
+                        tips=trip_dict.get("tips", 0.0),
+                        extras=trip_dict.get("extras", 0.0),
+                        tolls=trip_dict.get("tolls", 0.0),
+                        tax=trip_dict.get("tax", 0.0),
+                        imp_tax=trip_dict.get("imp_tax", 0.0),
+                        total_amount=trip_dict.get("total_amount", 0.0),
+                        gps_start_lat=trip_dict.get("gps_start_lat"),
+                        gps_start_lon=trip_dict.get("gps_start_lon"),
+                        gps_end_lat=trip_dict.get("gps_end_lat"),
+                        gps_end_lon=trip_dict.get("gps_end_lon"),
+                        from_address=trip_dict.get("from_address"),
+                        to_address=trip_dict.get("to_address"),
+                        payment_type=trip_dict.get("payment_type", "T"),
+                        cc_number=trip_dict.get("cc_number"),
+                        auth_code=trip_dict.get("auth_code"),
+                        auth_amount=trip_dict.get("auth_amount", 0.0),
+                        ehail_fee=trip_dict.get("ehail_fee", 0.0),
+                        health_fee=trip_dict.get("health_fee", 0.0),
+                        congestion_fee=trip_dict.get("congestion_fee", 0.0),
+                        airport_fee=trip_dict.get("airport_fee", 0.0),
+                        cbdt_fee=trip_dict.get("cbdt_fee", 0.0),
+                        passengers=trip_dict.get("passengers", 1),
+                        distance_service=trip_dict.get("distance_service", 0.0),
+                        distance_bs=trip_dict.get("distance_bs", 0.0),
+                        reservation_number=trip_dict.get("reservation_number"),
+                        import_id=import_log.id,
+                    )
+                    new_trips_data.append(trip_create)
+                except Exception as e:
+                    logger.error("Failed to create trip data", record_id=record_id, error=str(e))
+                    continue
+
+            # === Bulk insert new trips ===
+            success_count = 0
+            if new_trips_data:
+                created_trips = await self.repo.bulk_create_trips(new_trips_data)
+                success_count = len(created_trips)
+                logger.info("Trips inserted", count=success_count)
+
+            # === Update import log ===
+            await self.repo.update_import_log(
+                import_log.id,
+                CURBImportLogUpdate(
+                    import_end=datetime.now(timezone.utc),
+                    success_count=success_count,
+                    duplicate_count=duplicate_count,
+                    failure_count=len(trips) - success_count - duplicate_count,
+                    status="COMPLETED" if success_count > 0 else "FAILED"
+                )
             )
 
-            db.add(log)
-            db.commit()
+            # === Commit transaction ===
+            await self.repo.db.commit()
 
-            for trip in new_trips:
-                trip.import_id = log.id
+            logger.info(
+                "Import completed",
+                log_id=import_log.id,
+                total=len(trips),
+                success=success_count,
+                duplicates=duplicate_count,
+            )
 
-            db.bulk_save_objects(new_trips)
-
-            log.import_end = datetime.now()
-            log.status = "COMPLETED"
-            db.commit()
-
-            return {"inserted": len(new_trips), "total": len(trips) - len(new_trips)}
+            return CURBImportResult(
+                success=True,
+                log_id=import_log.id,
+                total_records=len(trips),
+                success_count=success_count,
+                duplicate_count=duplicate_count,
+                failure_count=len(trips) - success_count - duplicate_count,
+                message=f"Successfully imported {success_count} trips {duplicate_count} duplicates skipped"
+            )
         except Exception as e:
-            logger.error("Error importing CURB trips: %s", str(e), exc_info=True)
-            raise e
+            logger.error("Import failed", error=str(e), exc_info=True)
+            await self.repo.db.rollback()
+            raise CURBImportException(str(e)) from e
+        
+    # === Reconciliation Operations ===
 
-    def reconcile_curb_trips(
-        self, db: Session, trip_ids: list[str], recon_stat: int, recon_by: str = "SYSTEM"
-    ) -> dict:
-        """Reconcile CURB trips locally in the database only."""
+    async def reconcile_trips_locally(
+        self,
+        trip_ids: Optional[List[int]] = None,
+        recon_stat: Optional[int] = None,
+        recon_by: str = "SYSTEM"
+    ) -> CURBReconciliationResult:
+        """
+        Reconcile trips locally in the database.
+        For dev/uat: marks trips as reconciled without calling CURB API.
+        """
+        logger.info("Starting local reconciliation", trip_ids=trip_ids, recon_stat=recon_stat)
+
         try:
-            if recon_stat < 0:
-                raise ValueError("RECON_STAT must be a positive receipt number")
+            # === Get trips to reconcile ===
+            if trip_ids:
+                trips = []
+                for trip_id in trip_ids:
+                    trip = await self.repo.get_trip_by_id(trip_id)
+                    if trip:
+                        trips.append(trip)
+            else:
+                trips = await self.repo.get_unreconciled_trips()
 
-            # Step 1: Fetch the matching trips
-            trips = db.query(CURBTrip).filter(CURBTrip.id.in_(trip_ids)).all()
             if not trips:
-                raise ValueError("No valid trips found for reconcilation")
-
-            # Step 2: Local reconciliation - Update database records only
-            now = datetime.now(timezone.utc)
-            reconciled_trip_ids = []
+                logger.info("No trips to reconcile")
+                return CURBReconciliationResult(
+                    success=True,
+                    total_processed=0,
+                    reconciled_count=0,
+                    already_reconciled_count=0,
+                    failed_count=0,
+                    recon_stat=recon_stat or 0,
+                    message="No trips to reconcile"
+                )
             
+            # === Generate recon stat if not provided ===
+            if not recon_stat:
+                recon_stat = int(datetime.now(timezone.utc).timestamp())
+
+            # === Process trips ===
+            reconciled_count = 0
+            already_reconciled = 0
+            failed_count = 0
+            reconciliations_to_create = []
+
             for trip in trips:
-                # Skip if already reconciled
                 if trip.is_reconciled:
-                    logger.info("Trip %s already reconciled, skipping", trip.id)
+                    already_reconciled += 1
+                    logger.debug("Trip already reconciled", trip_id=trip.id)
                     continue
-                    
-                # Mark trip as reconciled locally
-                trip.recon_stat = recon_stat
-                trip.is_reconciled = True
-                
-                # Create reconciliation record
-                db.add(CURBTripReconcilation(
-                    trip_id=trip.id,
-                    recon_stat=recon_stat,
-                    reconciled_at=now,
-                    reconciled_by=recon_by
-                ))
-                
-                reconciled_trip_ids.append(trip.id)
 
-            db.commit()
-            
-            logger.info("Successfully reconciled %s trips locally with recon_stat: %s", len(reconciled_trip_ids), recon_stat)
+                try:
+                    # === Update trip status ===
+                    await self.repo.update_trip(
+                        trip.id,
+                        CURBTripUpdate(
+                            is_reconciled=True,
+                            recon_stat=recon_stat,
+                            status="Reconciled"
+                        )
+                    )
 
-            return {
-                "success": True,
-                "trip_ids": reconciled_trip_ids,
-                "recon_stat": recon_stat,
-                "reconciled_count": len(reconciled_trip_ids),
-                "message": f"Local reconciliation completed for {len(reconciled_trip_ids)} trips"
-            }
-        except Exception as e:
-            logger.error("Error reconciling CURB trips locally: %s", str(e), exc_info=True)
-            raise e
+                    # === Create reconciliation record ===
+                    reconciliations_to_create.append(
+                        CURBTripReconciliationCreate(
+                            trip_id=trip.id,
+                            recon_stat=recon_stat,
+                            reconciled_by=recon_by,
+                            reconciliation_type="LOCAL"
+                        )
+                    )
+                    reconiled_count += 1
 
-    def bulk_associate_and_post_trips(
-        self, db: Session, posted_by="SYSTEM"
-    ) -> dict:
-        """Bulk associate and post trips to CURB"""
-        try:
-            from app.ledger.services import ledger_service
-            
-            # Step 1: Fetch unreconciled but not posted trips
-            trips = db.query(CURBTrip).filter(
-                CURBTrip.is_reconciled == True,
-                CURBTrip.is_posted == False
+                except Exception as e:
+                    logger.error("Failed to reconcile trip", trip_id=trip.id, error=str(e))
+                    failed_count += 1
+
+            # === Bulk create reconciliation records ===
+            if reconciliations_to_create:
+                await self.repo.bulk_create_reconciliations(reconciliations_to_create)
+
+            # === Commit transaction ===
+            await self.repo.db.commit()
+
+            logger.info(
+                "Local reconciliation completed",
+                total=len(trips),
+                reconciled_count=reconciled_count,
+                already_reconciled_count=already_reconciled,
+                failed_count=failed_count,
+                recon_stat=recon_stat,
+                message=f"Successfully reconciled {reconciled_count} trips locally"
             )
 
-            posted, skipped, errors = [], [], []
+        except Exception as e:
+            logger.error("Local reconciliation failed", error=str(e), exc_info=True)
+            await self.repo.db.rollback()
+            raise CURBReconciliationException(str(e)) from e
+        
+    async def reconcile_trips_on_server(
+        self, trip_ids: List[int], recon_stat: int, recon_by: str = "SYSTEM"
+    ) -> CURBReconciliationResult:
+        """
+        Reconcile trips on CURB server via SOAP API.
+        For production: calls CURB API to mark trips as reconciled.
+        """
+        logger.info("Starting server reconciliation", trip_ids=trip_ids, recon_stat=recon_stat)
+
+        try:
+            # === Get trips ===
+            trips = []
+            for trip_id in trip_ids:
+                trip = await self.repo.get_trip_by_id(trip_id)
+                if trip:
+                    trips.append(trip)
+
+            if not trips:
+                raise CURBReconciliationException("No valid trips found")
+            
+            # === Extract record IDs ===
+            record_ids = [trip.record_id for trip in trips]
+
+            # === Call CURB API to reconcile on server ===
+            try:
+                reconcile_trips_on_server(record_ids, recon_stat)
+                logger.info("Server reconciliation API call succeeded")
+            except Exception as e:
+                logger.error("Server reconciliation API call failed", error=str(e))
+                raise CURBReconciliationException(f"CURB API call failed: {str(e)}") from e
+            
+            # === Update trips locally after successful API call ===
+            reconciled_count = 0
+            failed_count = 0
+            reconciliations_to_create = []
 
             for trip in trips:
-                # Step 2: Resolve active lease
-                lease = lease_service.get_lease(db, driver_id=trip.driver_id, plate_number=trip.cab_number)
-                if not lease:
-                    skipped.append((trip.id, "Lease not found"))
-                    continue
-
-                # Step 3: Avoid duplicate posting
-                ledger_entry = ledger_service.get_ledger_entries(
-                    db=db,ledger_source=LedgerSourceType.CURB, source_id=trip.id
-                )
-
-                if ledger_entry:
-                    skipped.append((trip.id, "Already exists in ledger"))
-                    trip.is_posted = True
-                    continue
-
-                driver = driver_service.get_drivers(db, driver_id=trip.driver_id)
-                ledger_entry = ledger_service.upsert_ledgers(db, {
-                    "driver_id": driver.id,
-                    "medallion_id": lease.medallion_id,
-                    "vehicle_id": lease.vehicle_id,
-                    "amount": trip.total_amount or 0.0,
-                    "debit": True,
-                    "source_type": LedgerSourceType.CURB,
-                    "source_id": trip.id,
-                    "description":f"CURB trip {trip.record_id}-{trip.period} posted"
-                })
-
-                db.add(ledger_entry)
-                trip.is_posted = True
-                posted.append(trip.id)
-            
-            db.commit()
-
-            return {
-                "posted_count": len(posted),
-                "skipped": skipped,
-                "errors": errors
-            }
-        except Exception as e:
-            logger.error("Error bulk associating and posting trips to CURB: %s", str(e), exc_info=True)
-            raise e
-
-    def associate_and_post_trip(
-        self, db: Session, trip_id: int, posted_by="SYSTEM"
-    ):
-        """Associate and post a single trip to CURB"""
-        try:
-            from app.ledger.services import ledger_service
-            
-            # Step 1: Fetch the trip
-            trip = db.query(CURBTrip).filter(
-                CURBTrip.id == trip_id,
-                CURBTrip.is_reconciled == True,
-                CURBTrip.is_posted == False
-            ).first()
-            if not trip:
-                raise ValueError("Trip not found or already posted")
-            
-            # Step 2: Resolve active lease
-            lease = lease_service.get_lease(db, driver_id=trip.driver_id, plate_number=trip.cab_number)
-            if not lease:
-                raise ValueError("Lease not found")
-            
-            # Step 3: Avoid duplicate posting
-            ledger_entry = ledger_service.get_ledger_entries(
-                db, ledger_source=LedgerSourceType.CURB, source_id=trip.id
-            )
-
-            if ledger_entry:
-                raise ValueError("Already exists in ledger")
-
-            ledger_entry = ledger_service.upsert_ledgers(db, {
-                "driver_id": trip.driver_id,
-                "medallion_id": lease.medallion_id,
-                "vehicle_id": lease.vehicle_id,
-                "amount": trip.total_amount or 0.0,
-                "debit": True,
-                "source_type": LedgerSourceType.CURB,
-                "source_id": trip.id,
-                "description":f"CURB trip {trip.curb_record_id}-{trip.period} posted"
-            })
-
-            db.add(ledger_entry)
-            trip.is_posted = True
-
-            db.commit()
-
-            return {
-                "success": True,
-            }
-        except Exception as e:
-            logger.error("Error associating and posting trip to CURB: %s", str(e), exc_info=True)
-            raise e
-
-    def parse_comma_values(self, val: Optional[str]):
-        """Parse comma-separated values into a list."""
-        return [v.strip() for v in val.split(",") if v.strip()] if val else []
-
-    def list_curb_trips(
-        self, db: Session, page: int, per_page: int,
-        sort_by: str, sort_order: str, filters: dict
-    ):
-        """List CURB trips with optional filters, sort, and pagination."""
-        try:
-            logger.debug("list_curb_trips called with: page=%d, per_page=%d, sort_by=%s, sort_order=%s", 
-                        page, per_page, sort_by, sort_order)
-            
-            # First, get the trip IDs with pagination applied
-            trip_ids_query = db.query(CURBTrip.id)
-
-            # Apply filters to the trip_ids_query
-            if filters.get("driver_id"):
-                trip_ids_query = trip_ids_query.filter(
-                    CURBTrip.driver_id.in_(self.parse_comma_values(filters["driver_id"]))
-                )
-            if filters.get("cab_number"):
-                trip_ids_query = trip_ids_query.filter(
-                    CURBTrip.cab_number.in_(self.parse_comma_values(filters["cab_number"]))
-                )
-            if filters.get("trip_id"):
-                trip_ids = [int(t) for t in self.parse_comma_values(filters["trip_id"])]
-                trip_ids_query = trip_ids_query.filter(CURBTrip.id.in_(trip_ids))
-            if filters.get("from_date") and filters.get("to_date"):
-                trip_ids_query = trip_ids_query.filter(
-                    CURBTrip.start_date.between(filters["from_date"], filters["to_date"])
-                )
-            if filters.get("start_time_from") and filters.get("start_time_to"):
-                trip_ids_query = trip_ids_query.filter(
-                    CURBTrip.start_time.between(
-                        filters["start_time_from"], filters["start_time_to"]
+                try:
+                    await self.repo.update_trip(
+                        trip.id,
+                        CURBTripUpdate(
+                            is_reconciled=True,
+                            recon_stat=recon_stat,
+                            status="Reconciled"
+                        )
                     )
-                )
-            if filters.get("end_time_from") and filters.get("end_time_to"):
-                trip_ids_query = trip_ids_query.filter(
-                    CURBTrip.end_time.between(
-                        filters["end_time_from"], filters["end_time_to"]
+
+                    reconciliations_to_create.append(
+                        CURBTripReconciliationCreate(
+                            trip_id=trip.id,
+                            recon_stat=recon_stat,
+                            reconciled_by=recon_by,
+                            reconciliation_type="REMOTE"
+                        )
                     )
-                )
-            if filters.get("payment_type"):
-                trip_ids_query = trip_ids_query.filter(
-                    CURBTrip.payment_type.in_(self.parse_comma_values(filters["payment_type"]))
-                )
-            if filters.get("gps_start_lat"):
-                trip_ids_query = trip_ids_query.filter(
-                    CURBTrip.gps_start_lat.cast(String).like(f"%{filters['gps_start_lat']}%")
-                )
-            if filters.get("gps_end_lat"):
-                trip_ids_query = trip_ids_query.filter(
-                    CURBTrip.gps_end_lat.cast(String).like(f"%{filters['gps_end_lat']}%")
-                )
-            if filters.get("distance"):
-                trip_ids_query = trip_ids_query.filter(
-                    CURBTrip.distance_service.cast(String).like(f"%{filters['distance']}%")
-                )
-            if filters.get("status"):
-                status = filters["status"]
-                if status == "reconciled":
-                    trip_ids_query = trip_ids_query.filter(CURBTrip.is_reconciled.is_(True))
-                elif status == "unreconciled":
-                    trip_ids_query = trip_ids_query.filter(CURBTrip.is_reconciled.is_(False))
-                elif status == "posted":
-                    trip_ids_query = trip_ids_query.filter(CURBTrip.is_posted.is_(True))
-                elif status == "unposted":
-                    trip_ids_query = trip_ids_query.filter(CURBTrip.is_posted.is_(False))
+                    reconciled_count += 1
+                except Exception as e:
+                    logger.error("Failed to update trip after reconciliation", trip_id=trip.id, error=str(e))
+                    failed_count += 1
 
-            # Additional filters that require JOINs - apply to trip_ids_query with JOINs
-            if filters.get("medallion_number") or filters.get("tlc_license_number"):
-                if filters.get("medallion_number"):
-                    trip_ids_query = trip_ids_query.join(Driver, Driver.driver_id == CURBTrip.driver_id)\
-                        .join(LeaseDriver, LeaseDriver.driver_id == Driver.driver_id)\
-                        .join(Lease, Lease.id == LeaseDriver.lease_id)\
-                        .join(Medallion, Medallion.id == Lease.medallion_id)\
-                        .filter(Medallion.medallion_number.in_(self.parse_comma_values(filters["medallion_number"])))
-                
-                if filters.get("tlc_license_number"):
-                    if not filters.get("medallion_number"):  # Avoid double join
-                        trip_ids_query = trip_ids_query.join(Driver, Driver.driver_id == CURBTrip.driver_id)
-                    trip_ids_query = trip_ids_query.join(TLCLicense, TLCLicense.id == Driver.tlc_license_number_id)\
-                        .filter(TLCLicense.tlc_license_number.in_(self.parse_comma_values(filters["tlc_license_number"])))
+            # === Bulk create reconciliation records ===
+            if reconciliations_to_create:
+                await self.repo.bulk_create_reconciliations(reconciliations_to_create)
 
-            # Get total count
-            total = trip_ids_query.count()
-            total_revenue = (
-                    db.query(func.sum(CURBTrip.total_amount))
-                    .filter(CURBTrip.id.in_(trip_ids_query.with_entities(CURBTrip.id)))
-                    .scalar()
-                ) or 0.0
-            logger.debug("[Task ID: Fetch CURB Trips] Total trips found: %d", total)
+            # === Commit transaction ===
+            await self.repo.db.commit()
 
-            # Apply sorting and pagination to trip_ids_query
-            allowed_sort_fields = ["start_date", "cab_number", "driver_id", "distance_service", "payment_type", "start_time", "end_time"]
-            sort_by = sort_by if sort_by in allowed_sort_fields else "start_date"
-            sort_column = getattr(CURBTrip, sort_by)
-            order_fn = desc if sort_order == "desc" else asc
-            
-            offset = (page - 1) * per_page
-            logger.debug("[Task ID: Fetch CURB Trips] Applying pagination: offset=%d, limit=%d", offset, per_page)
-            
-            paginated_trip_ids = trip_ids_query.order_by(order_fn(sort_column)).offset(offset).limit(per_page).all()
-            trip_ids_list = [trip_id[0] for trip_id in paginated_trip_ids]
-            
-            logger.debug("[Task ID: Fetch CURB Trips] Got %d trip IDs for page %d", len(trip_ids_list), page)
-
-            # Now get the full trip data with JOINs for only the paginated trips
-            query = (
-                db.query(
-                    CURBTrip,
-                    TLCLicense.tlc_license_number.label('tlc_license_number'),
-                    Medallion.medallion_number.label('medallion_number')
-                )
-                .filter(CURBTrip.id.in_(trip_ids_list))
-                .outerjoin(Driver, Driver.driver_id == CURBTrip.driver_id)
-                .outerjoin(LeaseDriver, LeaseDriver.driver_id == Driver.driver_id)
-                .outerjoin(Lease, Lease.lease_id == LeaseDriver.lease_id)
-                .outerjoin(Medallion, Medallion.id == Lease.medallion_id)
-                .outerjoin(TLCLicense, TLCLicense.id == Driver.tlc_license_number_id)
-                .order_by(order_fn(sort_column))
+            logger.info(
+                "Server reconciliation completed",
+                reconciled=reconciled_count,
+                failed=failed_count
             )
 
-            results = query.all()
-            logger.debug("[Task ID: Fetch CURB Trips] Fetched %d trips for page %d with per_page %d", len(results), page, per_page)
-            
-            # Define payment type mapping
-            pay_type = {
-                "$": "Cash",
-                "P": "Private",
-                "C": "Card"
-            }
-            
-            # Serialize results
-            items = [
-                {
-                    "trip_id": trip.id,
-                    "driver_id": trip.driver_id,
-                    "cab_number": trip.cab_number,
-                    "trip_start_date": trip.start_date,
-                    "trip_end_date": trip.end_date,
-                    "start_time": trip.start_time,
-                    "end_time": trip.end_time,
-                    "distance": trip.distance_service,
-                    "gps_start_lat": trip.gps_start_lat,
-                    "gps_start_lon": trip.gps_start_lon,
-                    "gps_end_lat": trip.gps_end_lat,
-                    "gps_end_lon": trip.gps_end_lon,
-                    "from_address": trip.from_address,
-                    "to_address": trip.to_address,
-                    "tips": trip.tips,
-                    "extras": trip.extras,
-                    "tolls": trip.tolls,
-                    "tax": trip.tax,
-                    "imp_tax": trip.imp_tax,
-                    "ehail_fee": trip.ehail_fee,
-                    "health_fee": trip.health_fee,
-                    "total_amount": trip.total_amount,
-                    "payment_type": pay_type[trip.payment_type] if trip.payment_type in pay_type else trip.payment_type,
-                    "is_reconciled": trip.is_reconciled,
-                    "is_posted": trip.is_posted,
-                    "tlc_license_number": tlc_num,
-                    "medallion_number": med_num,
-                }
-                for trip, tlc_num, med_num in results
-            ]
-
-            result = {
-                "items": items,
-                "total_items": total,
-                "total_revenue": total_revenue,
-                "filters": {
-                    "status": {
-                        "type": "select",
-                        "label": "Status",
-                        "placeholder": "Select Status",
-                        "options": [
-                            {"label": "Reconciled", "value": "reconciled"},
-                            {"label": "Unreconciled", "value": "unreconciled"},
-                            {"label": "Posted", "value": "posted"},
-                            {"label": "Unposted", "value": "unposted"},
-                        ]
-                    },
-                    "payment_type": {
-                        "type": "select",
-                        "label": "Payment Type",
-                        "placeholder": "Select Payment Type",
-                        "options": [
-                            {"label": "Cash", "value": "T"},
-                            {"label": "Private Card", "value": "P"},
-                            {"label": "Credit Card", "value": "C"},
-                        ]
-                    }
-                },
-                "status_list": ["reconciled", "unreconciled", "posted", "unposted"],
-                "payment_type_list": ["T", "P", "C"],
-                "page": page,
-                "per_page": per_page,
-                "total_pages": ceil(total / per_page),
-                "sort_fields": allowed_sort_fields
-            }
-            
-            logger.debug("[Task ID: Fetch CURB Trips] Returning %d items, total_items=%d, page=%d, per_page=%d, total_pages=%d", 
-                        len(items), total, page, per_page, ceil(total / per_page))
-            
-            return result
-
-        except Exception as e:
-            logger.exception("Error listing CURB trips")
-            raise e
-
-    def get_curb_trip(
-        self, db: Session,
-        trip_id: Optional[int] = None,
-        record_id: Optional[str] = None,
-        period: Optional[str] = None,
-        driver_id: Optional[str] = None,
-        cab_number: Optional[str] = None,
-        start_date_from: Optional[datetime] = None,
-        start_date_to: Optional[datetime] = None,
-        end_date_from: Optional[datetime] = None,
-        end_date_to: Optional[datetime] = None,
-        payment_type: Optional[str] = None,
-        is_reconciled: Optional[bool] = None,
-        is_posted: Optional[bool] = None,
-        multiple: Optional[bool] = False,
-        sort_by: Optional[str] = None,
-        sort_order: Optional[str] = None
-    ) -> Union[CURBTrip, List[CURBTrip]]:
-        """Get CURB trip by ID, record ID, or multiple filters"""
-        try:
-            query = db.query(CURBTrip)
-
-            if trip_id:
-                query = query.filter(CURBTrip.id == trip_id)
-            if record_id:
-                query = query.filter(CURBTrip.record_id == record_id)
-            if period:
-                query = query.filter(CURBTrip.period == period)
-            if driver_id:
-                query = query.filter(CURBTrip.driver_id == driver_id)
-            if cab_number:
-                query = query.filter(CURBTrip.cab_number == cab_number)
-            if start_date_from:
-                query = query.filter(CURBTrip.start_date >= start_date_from)
-            if start_date_to:
-                query = query.filter(CURBTrip.start_date <= start_date_to)
-            if end_date_from:
-                query = query.filter(CURBTrip.end_date >= end_date_from)
-            if end_date_to:
-                query = query.filter(CURBTrip.end_date <= end_date_to)
-            if payment_type:
-                query = query.filter(CURBTrip.payment_type == payment_type)
-            if is_reconciled is not None:
-                query = query.filter(CURBTrip.is_reconciled == is_reconciled)
-            if is_posted is not None:
-                query = query.filter(CURBTrip.is_posted == is_posted)
-
-            if sort_by and sort_order:
-                query = query.order_by(
-                    desc(getattr(CURBTrip, sort_by)) if sort_order == "desc" else asc(getattr(CURBTrip, sort_by))
-                )
-            
-            if multiple:
-                return query.all()
-            else:
-                return query.first()
-        except Exception as e:
-            logger.error("Error getting CURB trip: %s", str(e), exc_info=True)
-            raise e
-
-    def get_curb_revenue(
-        self, db: Session, start_date, end_date, driver_id
-    ):
-        """Get CURB revenue for the trip"""
-        try:
-            return db.query(func.sum(CURBTrip.total_amount)).filter(
-                CURBTrip.driver_id == str(driver_id),
-                CURBTrip.start_date >= start_date,
-                CURBTrip.end_date <= end_date
-            ).scalar() or 0.0
-        except Exception as e:
-            logger.error("Error getting CURB revenue: %s", str(e), exc_info=True)
-            raise e
-
-    def finalize_driver_payments(
-        self, db: Session, start_date, end_date
-    ):
-        """Finalize Driver Payments"""
-        try:
-            dtrs = db.query(DailyReceipt).filter(
-                DailyReceipt.period_start >= start_date,
-                DailyReceipt.period_end <= end_date
-            ).all()
-
-            results = []
-            for dtr in dtrs:
-                driver = driver_service.get_drivers(db, id=dtr.driver_id)
-                lease = lease_service.get_lease(db, lookup_id=dtr.lease_id)
-                medallion = medallion_service.get_medallion(db, medallion_id=dtr.medallion_id)
-                curb_revenue = curb_service.get_curb_revenue(db, start_date, end_date, driver.driver_id)
-
-                # Total payments made via ledger (e.g., cash or DTR adjustments)
-                ledger_payments = db.query(func.sum(LedgerEntry.amount)).filter(
-                    LedgerEntry.driver_id == dtr.driver_id,
-                    LedgerEntry.created_on >= dtr.period_start,
-                    LedgerEntry.created_on <= dtr.period_end,
-                    LedgerEntry.debit == False
-                ).scalar() or 0.0
-
-                # Shift
-                shift = lease.lease_type if lease else "N/A"
-
-                results.append({
-                    "receipt_id": dtr.receipt_number,
-                    "receipt_date": dtr.period_start.date().isoformat(),
-                    "medallion_number": medallion.medallion_number if medallion else "N/A",
-                    "shift": shift,
-                    "ach": "Yes" if getattr(dtr, "is_ach_ready", False) else "No",
-                    "dtr_revenue": round(curb_revenue, 2),
-                    "cash_paid": round(dtr.cash_paid or 0.0, 2),
-                    "dtr_paid": round(ledger_payments, 2),
-                    "payment": round(dtr.balance or 0.0, 2),
-                    "receipt_urls": {
-                        "html": dtr.receipt_html_url,
-                        "pdf": dtr.receipt_pdf_url,
-                        "excel": dtr.receipt_excel_url
-                    }
-                })
-                
-            return results
-        except Exception as e:
-            logger.error("Error finalizing driver payments: %s", e, exc_info=True)
-            raise e
-
-    def bulk_reconcile_trips_locally(
-        self, db: Session, recon_by: str = "SYSTEM"  
-    ) -> dict:
-        """Bulk reconcile all unreconciled CURB trips locally without calling remote API."""
-        try:
-            # Get all unreconciled trips
-            unreconciled_trips = db.query(CURBTrip).filter(
-                CURBTrip.is_reconciled == False
-            ).all()
-            
-            if not unreconciled_trips:
-                logger.info("No unreconciled trips found for bulk reconciliation")
-                return {
-                    "success": True,
-                    "reconciled_count": 0,
-                    "message": "No trips to reconcile"
-                }
-            
-            # Generate a timestamp-based receipt number
-            recon_stat = int(datetime.now().timestamp())
-            
-            # Convert to string IDs as expected by reconcile_curb_trips
-            trip_ids = [str(trip.id) for trip in unreconciled_trips]
-            
-            logger.info("Starting bulk local reconciliation for %s trips", len(trip_ids))
-            
-            # Use existing reconciliation method (now local-only)
-            result = self.reconcile_curb_trips(
-                db=db, 
-                trip_ids=trip_ids, 
-                recon_stat=recon_stat, 
-                recon_by=recon_by
+            return CURBReconciliationResult(
+                success=True,
+                total_processed=len(trips),
+                reconciled_count=reconciled_count,
+                already_reconciled_count=0,
+                failed_count=failed_count,
+                recon_stat=recon_stat,
+                message=f"Successfully reconciled {reconciled_count} trips on server"
             )
-            
-            return result
-            
-        except Exception as e:
-            logger.error("Error in bulk local reconciliation: %s", str(e), exc_info=True)
-            raise e
         
-    def process_trips_for_date_range(
-        self, db: Session, from_date: date, to_date: date, import_by: str, driver_id: Optional[str] = None
-    ) -> dict:
-        """
-        A complete workflow to fetch, import, reconcile, and post trips for a specific date range.
-        Designed to be run in the background.
-        """
-        logger.info(f"Starting full trip processing for {from_date} to {to_date}")
-        try:
-            # Step 1: Fetch trips from the CURB SOAP API
-            # The SOAP client expects MM/DD/YYYY format
-            from_date_str = from_date.strftime("%m/%d/%Y")
-            to_date_str = to_date.strftime("%m/%d/%Y")
-
-            logger.info(f"Fetching trips from CURB API for dates: {from_date_str} to {to_date_str}")
-            if driver_id:
-                trip_xml_data = fetch_trips_log10(from_date=from_date_str, to_date=to_date_str, driver_id=driver_id)
-            else:
-                trip_xml_data = fetch_trips_log10(from_date=from_date_str, to_date=to_date_str)
-
-            if not trip_xml_data:
-                logger.warning(f"No trip data returned from CURB API for the specified date range.")
-                return
-            
-            # Step 2: Import the fetched trips into the database
-            import_result = self.import_curb_trips(
-                db=db, xml_data=trip_xml_data, import_source="Manual Import", import_by=import_by
-            )
-            inserted_count = import_result.get("inserted", 0)
-            logger.info(f"Imported {inserted_count} new trips from the manual fetch.")
-
-            # Step 3 & 4 only need to run if new trips were actually added
-            if inserted_count > 0:
-                # Step 3: Reconcile all newly imported and other unreconciled trips
-                logger.info("Proceeding with local bulk reconcilation")
-                self.bulk_reconcile_trips_locally(db=db, recon_by=import_by)
-
-                # Step 4: Post all newly reconciled and other unposted trips
-                logger.info("Proceeding with bulk posting of ledger.")
-                self.bulk_associate_and_post_trips(db=db, posted_by=import_by)
-
-            logger.info(f"Successfully completed manual trip processing for {from_date} to {to_date}")
-
         except Exception as e:
-            logger.error(f"An error occurred during manual trip processing: {str(e)}", exc_info=True)
-        
+            logger.error("Server reconciliation failed", error=str(e), exc_info=True)
+            await self.repo.db.rollback()
+            if isinstance(e, CURBReconciliationException):
+                raise
+            raise CURBReconciliationException(str(e)) from e
 
-curb_service = CURBService()
+    # === Association and Posting Operations ===
+
+    async def associate_and_post_trips(
+        self,
+        posted_by: str = "SYSTEM"
+    ) -> CURBPostingResult:
+        """
+        Associate trips with leases and post to ledger.
+        Processes reconciled but unposted trips.
+        """
+        logger.info("Starting trip association and posting")
+
+        try:
+            # === Get reconciled but unposted trips ===
+            trips = await self.repo.get_reconciled_unposted_trips()
+
+            if not trips:
+                logger.info("No trips to post")
+                return CURBPostingResult(
+                    success=True,
+                    total_processed=0,
+                    posted_count=0,
+                    failed_count=0,
+                    skipped_count=0,
+                    message="No trips to post"
+                )
+            
+            posted_count = 0
+            failed_count = 0
+            skipped_count = 0
+            details = []
+
+            for trip in trips:
+                try:
+                    # === Find active lease for the driver and medallion on trip date ===
+                    lease = await self.find_active_lease_for_trip(trip)
+                    if not lease:
+                        skipped_count += 1
+                        details.append(f"Trip {trip.id} skipped: No active lease found")
+                        logger.debug("No active lease found for trip", trip_id=trip.id)
+                        continue
+
+                    # === Create ledger entry ===
+                    ledger_entry = LedgerEntry(
+                        lease_id=lease.id,
+                        vehicle_id=lease.vehicle_id,
+                        medallion_id=lease.medallion_id,
+                        entry_date=trip.start_date,
+                        amount=trip.total_amount,
+                        description=f"CURB Trip {trip.trip_number} on {trip.start_date}",
+                        source_type=LedgerSourceType.CURB,
+                        source_id=trip.id,
+                        created_by=posted_by
+                    )
+                    self.repo.db.add(ledger_entry)
+                    await self.repo.db.flush()
+                    posted_count += 1
+                    details.append(f"Trip {trip.id} posted successfully")
+                    logger.debug("Trip posted successfully", trip_id=trip.id, ledger_id=ledger_entry.id)
+
+                    # === Update trip status ===
+                    await self.repo.update_trip(
+                        trip.id,
+                        CURBTripUpdate(
+                            is_posted=True,
+                            status="Posted"
+                        )
+                    )
+
+                    posted_count += 1
+
+                except Exception as e:
+                    logger.error("Failed to post trip", trip_id=trip.id, error=str(e))
+
+                    await self.repo.update_trip(
+                        trip.id,
+                        CURBTripUpdate(
+                            status="Failed",
+                            post_failed_reason=str(e)
+                        )
+                    )
+
+                    failed_count += 1
+                    details.append({
+                        "trip_id": trip.id,
+                        "record_id": trip.record_id,
+                        "error": str(e)
+                    })
+
+            # === Commit transaction ===
+            await self.repo.db.commit()
+
+            logger.info(
+                "Posting completed",
+                total=len(trips),
+                posted=posted_count,
+                failed=failed_count,
+                skipped=skipped_count,
+            )
+
+            return CURBPostingResult(
+                success=True,
+                total_processed=len(trips),
+                posted_count=posted_count,
+                failed_count=failed_count,
+                skipped_count=skipped_count,
+                message=f"Successfully posted {posted_count} trips to ledger",
+                details=details if details else None
+            )
+        
+        except Exception as e:
+            logger.error("Posting failed", error=str(e), exc_info=True)
+            await self.repo.db.rollback()
+            raise CURBPostingException(str(e)) from e
+
+    # === Import logs operation ===
+
+    async def get_import_log_by_id(self, log_id: int) -> CURBImportLog:
+        """Get import log by ID"""
+        logger.info("Getting import log", log_id=log_id)
+
+        log = await self.repo.get_import_log_by_id(log_id)
+        if not log:
+            raise CURBImportLogNotFoundException(log_id)
+        
+        return log
+
+    async def get_import_logs(
+        self,
+        filters: CURBImportLogFilters
+    ) -> Tuple[List[CURBImportLog], int]:
+        """Get import logs with filters and pagination"""
+        logger.info("Getting import logs", filters=filters.model_dump())
+
+        logs, total_count = await self.repo.get_import_logs(filters)
+        logger.info("Retrieved import logs", count=len(logs), total=total_count)
+
+        return logs, total_count
+
+    # === Helper Functions ===
+
+    async def find_active_lease_for_trip(self,trip: CURBTrip) -> Optional[Lease]:
+        """
+        Find an active lease for the driver and medallion on the trip date.
+        """
+        stmt = select(Lease).where(
+            and_(
+                Lease.driver_id == trip.driver_id,
+                Lease.medallion.has(Medallion.medallion_number == trip.cab_number),
+                Lease.start_date <= trip.start_date,
+                or_(Lease.end_date == None, Lease.end_date >= trip.start_date),
+                Lease.lease_status == "Active"
+            )
+        ).order_by(Lease.start_date.desc())
+
+        result = await self.repo.db.execute(stmt)
+        lease = result.scalars().first()
+        return lease
+
+                
+
