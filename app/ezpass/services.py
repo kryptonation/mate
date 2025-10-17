@@ -488,10 +488,10 @@ class EZPassService:
             
 
             if not vehicle:
-                logger.debug("No vehicle found for plate number", plate_no=plate_no)
+                logger.info("No vehicle found for plate number", plate_no=plate_no, cleaned_plate=cleaned_plate)
                 return None
             
-            logger.debug("Vehicle found", vehicle_id=vehicle.id, plate_no=plate_no)
+            logger.info("Vehicle found", vehicle_id=vehicle.id, plate_no=plate_no)
 
             # === Find active lease for this vehicle on the transaction date ===
             lease_stmt = select(Lease).options(
@@ -507,6 +507,7 @@ class EZPassService:
                     Lease.lease_status == "Active"
                 )
             ).order_by(Lease.lease_start_date.desc())
+            logger.info("***** Finding lease stmt ****", stmt=lease_stmt)
 
             lease_result = await db.execute(lease_stmt)
             lease = lease_result.scalar_one_or_none()
