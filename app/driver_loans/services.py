@@ -24,11 +24,9 @@ from app.driver_loans.schemas import (
 )
 from app.driver_loans.models import DriverLoan, DriverLoanInstallment
 from app.driver_loans.exceptions import (
-    DriverLoanNotFoundException, DriverLoanInstallmentNotFoundException,
-    DriverLoanCreationException, DriverLoanScheduleException,
+    DriverLoanNotFoundException, DriverLoanCreationException,
     DriverLoanPostingException, DriverLoanStatusException,
 )
-from app.ledger.models import LedgerEntry, LedgerSourceType
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -217,7 +215,7 @@ class DriverLoanService:
         except Exception as e:
             await self.repo.rollback()
             logger.error("Failed to create loan", error=str(e))
-            raise DriverLoanCreationException(f"Failed to create loan: {str(e)}")
+            raise DriverLoanCreationException(f"Failed to create loan: {str(e)}") from e
         
     async def get_loan_by_id(self, loan_id: int) -> DriverLoan:
         """Get a loan by ID."""
@@ -226,7 +224,7 @@ class DriverLoanService:
         loan = await self.repo.get_loan_by_id(loan_id)
         if not loan:
             logger.error("Loan not found", loan_id=loan_id)
-            raise DriverLoanNotFoundException("Loan not found.", loan_id=loan_id)
+            raise DriverLoanNotFoundException(loan_id)
         
         return loan
     
@@ -412,6 +410,173 @@ class DriverLoanService:
             last_calculation_date = current_week_end
 
         return schedule
+    
+    def _calculate_start_week(
+        self, loan_date: date, start_week_option: StartWeekOption
+    ) -> date:
+        """
+        Calculate the Sunday when repayment starts based on the option.
+        """
+        # === Find the next Sunday from loan date ===
+        days_until_sunday = (6 - loan_date.weekday()) % 7
+        if days_until_sunday == 0 and loan_date.weekday() == 6:
+            # === If loan date is Sunday, next Sunday is in 7 days ===
+            days_until_sunday = 7
+
+        next_sunday = loan_date + timedelta(days=days_until_sunday)
+
+        if start_week_option == StartWeekOption.CURRENT:
+            return next_sunday
+        else: # Next
+            return next_sunday + timedelta(days=7)
+        
+    def _validate_status_transition(
+        self, current_status: str, new_status: LoanStatus
+    ) -> bool:
+        """Validate if status transition is allowed."""
+        allowed_transitions = {
+            "Draft": ["Open", "Cancelled"],
+            "Open": ["Hold", "Closed"],
+            "Hold": ["Open", "Closed"],
+            "Closed": [],
+            "Cancelled": [],
+        }
+
+        return new_status in allowed_transitions.get(current_status, [])
+    
+    # === Installment Operations ===
+
+    async def get_installments(
+        self, filters: DriverLoanInstallmentFilters,
+    ) -> Tuple[List[DriverLoanInstallment], int]:
+        """Get installments with filters and pagination."""
+        logger.debug("Getting installments with filters")
+        return await self.repo.get_installments(filters)
+    
+    async def process_due_installments(
+        self, as_of_date: Optional[date] = None,
+    ) -> LoanPostingResult:
+        """
+        Process all due installments for posting to ledger.
+        This would typically be called by a scheduled task every Sunday at 5:00 AM.
+        """
+        if not as_of_date:
+            as_of_date = date.today()
+
+        logger.info("Processing due installments", as_of_date=str(as_of_date))
+
+        try:
+            # === Mark scheduled installments as due ===
+            marked_count = await self.repo.mark_installments_due(as_of_date)
+
+            # === Get all due installments ===
+            due_installments = await self.repo.get_due_installments(as_of_date)
+
+            posted_count = 0
+            failed_count = 0
+            details = []
+
+            for installment in due_installments:
+                try:
+                    # === Post to ledger (Simplified) ===
+                    # TODO: Implement integration with ledger service
+                    await self._post_installment_to_ledger(installment)
+
+                    # === Update installment status ===
+                    await self.repo.update_installment(
+                        installment,
+                        DriverLoanInstallmentUpdate(
+                            status=InstallmentStatus.POSTED,
+                            posting_date=datetime.now(timezone.utc),
+                            ledger_posting_ref=f"LED-{installment.installment_id}"
+                        )
+                    )
+
+                    # === Update loan balances ===
+                    await self.repo.update_loan_balances(
+                        installment.loan_id,
+                        installment.principal_amount,
+                        installment.interest_amount,
+                    )
+
+                    posted_count += 1
+                    details.append({
+                        "installment_id": installment.installment_id,
+                        "status": "Posted",
+                        "amount": str(installment.total_due),
+                    })
+
+                except Exception as e:
+                    failed_count += 1
+                    details.append({
+                        "installment_id": installment.installment_id,
+                        "status": "Failed",
+                        "error": str(e),
+                    })
+                    logger.error(
+                        "Failed to post installment", installment_id=installment.installment_id, error=str(e)
+                    )
+
+            # === Check for loans that should be closed ===
+            await self._check_and_close_completed_loans()
+
+            # === Create log entry ===
+            await self.repo.create_log(
+                DriverLoanLogCreate(
+                    log_date=datetime.now(timezone.utc),
+                    log_type="Post",
+                    records_impacted=posted_count + failed_count,
+                    status="Success" if failed_count == 0 else "Partial",
+                    details=f"Posted {posted_count}, Failed {failed_count}"
+                )
+            )
+
+            await self.repo.commit()
+
+            return LoanPostingResult(
+                success=True,
+                total_processed=len(due_installments),
+                posted_count=posted_count,
+                failed_count=failed_count,
+                message=f"Successfully posted {posted_count} installments",
+                details=details,
+            )
+        
+        except Exception as e:
+            await self.repo.rollback()
+            logger.error("Failed to process due installments", error=str(e))
+            raise DriverLoanPostingException(f"Failed to process installments: {str(e)}") from e
+        
+    async def _post_installment_to_ledger(
+        self, installment: DriverLoanInstallment
+    ) -> None:
+        """
+        Post an installment to the ledger system.
+        This is a simplified version - actual implementation would integrate with ledger service.
+        """
+        logger.debug(
+            "Posting installment to ledger",
+            installment_id=installment.installment_id,
+        )
+        # TODO: Implement actual ledger posting logic
+        # In actual implementation, this would:
+        # 1. Create ledger entry for principal
+        # 2. Create ledger entry for interest (if applicable)
+        # 3. Link to driver's DTR
+        # 4. Update ledger balances
+        
+        # Placeholder for ledger integration
+        pass
+
+    async def _check_and_close_completed_loans(self) -> None:
+        """Check for loans with all installments paid and close them."""
+        # TODO: Implement logic to check and close loans
+        # This would check for loans where:
+        # 1. All installments are in "Posted" or "Paid" status
+        # 2. Outstanding balance is 0
+        # Then update loan status to "Closed"
+        pass
+
     
     
 
