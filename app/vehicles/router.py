@@ -24,7 +24,6 @@ from app.leases.schemas import LeaseStatus
 from app.leases.services import lease_service
 from app.medallions.schemas import MedallionStatus
 from app.medallions.services import medallion_service
-from app.notifications.fcm.fcm import send_fcm_notification_to_topic
 from app.uploads.services import upload_service
 from app.users.models import User
 from app.users.utils import get_current_user

@@ -27,8 +27,8 @@ from app.esign.router import router as esign_routes
 from app.curb.router import router as curb_routes
 from app.ledger.router import router as ledger_routes
 from app.driver_payment.router import router as driver_payment_routes
-from app.periodic_reports.router import router as periodic_reports_routes
 from app.driver_loans.router import router as driver_loan_routes
+from app.repairs.router import router as repair_routes
 # from app.notifications.routes import router as notification_routes
 
 @asynccontextmanager
@@ -86,6 +86,7 @@ bat_app.include_router(dashboard_routes)
 bat_app.include_router(entity_routes)
 bat_app.include_router(medallion_routes)
 bat_app.include_router(vehicle_routes)
+bat_app.include_router(repair_routes)
 bat_app.include_router(driver_routes)
 bat_app.include_router(driver_loan_routes)
 bat_app.include_router(lease_routes)
@@ -99,7 +100,6 @@ bat_app.include_router(esign_routes)
 bat_app.include_router(curb_routes)
 bat_app.include_router(driver_payment_routes)
 bat_app.include_router(ledger_routes)
-bat_app.include_router(periodic_reports_routes)
 
 
 # Root API to check if the server is up
