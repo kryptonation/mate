@@ -32,7 +32,8 @@ from app.curb.soap_client import reconcile_trips_on_server
 
 from app.leases.models import Lease
 from app.medallions.models import Medallion
-from app.ledger.models import LedgerEntry, LedgerSourceType
+from app.ledger.models import LedgerBalance
+from app.ledger.schemas import LedgerCategory
 
 from app.utils.logger import get_logger
 
@@ -475,22 +476,23 @@ class CURBService:
                         continue
 
                     # === Create ledger entry ===
-                    ledger_entry = LedgerEntry(
-                        lease_id=lease.id,
-                        vehicle_id=lease.vehicle_id,
-                        medallion_id=lease.medallion_id,
-                        entry_date=trip.start_date,
-                        amount=trip.total_amount,
-                        description=f"CURB Trip {trip.trip_number} on {trip.start_date}",
-                        source_type=LedgerSourceType.CURB,
-                        source_id=trip.id,
-                        created_by=posted_by
-                    )
-                    self.repo.db.add(ledger_entry)
-                    await self.repo.db.flush()
-                    posted_count += 1
-                    details.append(f"Trip {trip.id} posted successfully")
-                    logger.debug("Trip posted successfully", trip_id=trip.id, ledger_id=ledger_entry.id)
+                    # TODO: Implement actual ledger posting logic here
+                    # ledger_entry = LedgerEntry(
+                    #     lease_id=lease.id,
+                    #     vehicle_id=lease.vehicle_id,
+                    #     medallion_id=lease.medallion_id,
+                    #     entry_date=trip.start_date,
+                    #     amount=trip.total_amount,
+                    #     description=f"CURB Trip {trip.trip_number} on {trip.start_date}",
+                    #     source_type=LedgerSourceType.CURB,
+                    #     source_id=trip.id,
+                    #     created_by=posted_by
+                    # )
+                    # self.repo.db.add(ledger_entry)
+                    # await self.repo.db.flush()
+                    # posted_count += 1
+                    # details.append(f"Trip {trip.id} posted successfully")
+                    # logger.debug("Trip posted successfully", trip_id=trip.id, ledger_id=ledger_entry.id)
 
                     # === Update trip status ===
                     await self.repo.update_trip(

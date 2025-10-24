@@ -29,6 +29,8 @@ from app.repairs.utils import (
     validate_invoice_date, validate_repair_amount,
     validate_state_transition
 )
+from app.ledger.services import LedgerService
+from app.ledger.schemas import LedgerCategory
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -533,10 +535,25 @@ class RepairService:
                     )
                     continue
                 
-                # TODO: Create ledger entry here
-                # ledger_entry = await self.ledger_service.create_entry(...)
-                # For now, just generate a reference
-                ledger_ref = f"LED-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{installment.id}"
+                ledger_service = LedgerService(self.repo.db)
+
+                posting, balance = await ledger_service.create_obligation_posting(
+                    category=LedgerCategory.REPAIR,
+                    reference_id=installment.installment_id,
+                    reference_type="REPAIR_INSTALLMENT",
+                    amount=installment.payment_amount,
+                    driver_id=installment.invoice.driver_id,
+                    vehicle_id=installment.invoice.vehicle_id,
+                    vin=installment.invoice.vin,
+                    plate=installment.invoice.plate,
+                    medallion_id=installment.invoice.medallion_id,
+                    lease_id=installment.invoice.lease_id,
+                    transaction_date=posting_date,
+                    description=f"Repair installment for invoice {installment.invoice.invoice_number}",
+                    created_by=None  # System posting
+                )
+
+                ledger_ref = posting.posting_id
                 
                 # Update installment
                 installment.status = InstallmentStatus.POSTED

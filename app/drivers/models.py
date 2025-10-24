@@ -4,11 +4,8 @@
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import relationship
 
-from app.core.config import settings
-
 # Local imports
 from app.core.db import Base
-from app.ledger.models import DailyReceipt
 from app.users.models import AuditMixin
 
 
@@ -285,8 +282,6 @@ class Driver(Base, AuditMixin):
     )
 
     lease_drivers = relationship("LeaseDriver", back_populates="driver")
-
-    daily_receipts = relationship("DailyReceipt", back_populates="driver")
 
     ledger_entries = relationship("LedgerEntry", back_populates="driver")
 

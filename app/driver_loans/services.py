@@ -27,6 +27,8 @@ from app.driver_loans.exceptions import (
     DriverLoanNotFoundException, DriverLoanCreationException,
     DriverLoanPostingException, DriverLoanStatusException,
 )
+from app.ledger.services import LedgerService
+from app.ledger.schemas import LedgerCategory
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -479,7 +481,6 @@ class DriverLoanService:
             for installment in due_installments:
                 try:
                     # === Post to ledger (Simplified) ===
-                    # TODO: Implement integration with ledger service
                     await self._post_installment_to_ledger(installment)
 
                     # === Update installment status ===
@@ -558,15 +559,19 @@ class DriverLoanService:
             "Posting installment to ledger",
             installment_id=installment.installment_id,
         )
-        # TODO: Implement actual ledger posting logic
-        # In actual implementation, this would:
-        # 1. Create ledger entry for principal
-        # 2. Create ledger entry for interest (if applicable)
-        # 3. Link to driver's DTR
-        # 4. Update ledger balances
-        
-        # Placeholder for ledger integration
-        pass
+        ledger_service = LedgerService(self.repo.db)
+
+        _, _ = await ledger_service.create_obligation_posting(
+            category=LedgerCategory.LOAN,
+            reference_id=installment.installment_id,
+            reference_type="LOAN_INSTALLMENT",
+            amount=installment.total_due,
+            driver_id=installment.loan.driver_id,
+            medallion_id=installment.loan.medallion_id,
+            transaction_date=datetime.now(timezone.utc),
+            description=f"Loan installment for {installment.loan.loan_id} (Principal: {installment.principal_amount}, Interest: {installment.interest_amount})",
+            created_by=None  # System posting
+        )
 
     async def _check_and_close_completed_loans(self) -> None:
         """Check for loans with all installments paid and close them."""

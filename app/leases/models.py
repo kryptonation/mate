@@ -17,7 +17,6 @@ from sqlalchemy.orm import Mapped, foreign, mapped_column, relationship
 from app.core.config import settings
 from app.core.db import Base
 from app.esign.models import ESignEnvelope
-from app.ledger.models import DailyReceipt
 from app.users.models import AuditMixin
 
 
@@ -377,7 +376,6 @@ class Lease(Base, AuditMixin):
         back_populates="lease"
     )
     lease_schedule: Mapped["LeaseSchedule"] = relationship(back_populates="lease")
-    daily_receipts: Mapped[list["DailyReceipt"]] = relationship(back_populates="lease")
 
     def to_dict(self):
         """Convert the Lease model to a dictionary"""

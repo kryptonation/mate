@@ -38,6 +38,8 @@ from app.drivers.models import Driver
 from app.medallions.models import Medallion
 from app.repairs.models import RepairInvoice
 from app.driver_loans.models import DriverLoan
+from app.ledger.schemas import LedgerCategory as LedgerCat
+from app.ledger.services import LedgerService
 
 from app.utils.logger import get_logger
 
@@ -399,41 +401,17 @@ class InterimPaymentService:
             reference_id=reference_id
         )
 
-        # TODO: Replace with actual Ledger_Balances query
-        # For now, return placeholder values
-        # In production, this would query:
-        # SELECT outstanding_balance FROM ledger_balances
-        # WHERE category = ? AND reference_id = ?
+        ledger_service = LedgerService(self.repo.db)
 
-        # Placeholder logic - replace with actual implementation
-        try:
-            # This is where you'd query Ledger_Balances table
-            # from app.ledger.models import LedgerBalance
-            # stmt = select(LedgerBalance).where(
-            #     and_(
-            #         LedgerBalance.category == category.value,
-            #         LedgerBalance.reference_id == reference_id
-            #     )
-            # )
-            # result = await self.repo.db.execute(stmt)
-            # ledger_balance = result.scalar_one_or_none()
-            # 
-            # if ledger_balance:
-            #     return ledger_balance.outstanding_balance
-            # else:
-            #     raise ObligationNotFoundException(category.value, reference_id)
-            
-            # Placeholder: return dummy balance
-            return Decimal("100.00")
-            
-        except Exception as e:
-            logger.error(
-                "Failed to get outstanding balance",
-                category=category.value,
-                reference_id=reference_id,
-                error=str(e)
-            )
-            raise ObligationNotFoundException(category.value, reference_id) from e
+        balance = await ledger_service.get_outstanding_balance(
+            reference_id=reference_id,
+            reference_type=category.value
+        )
+
+        if balance is None:
+            raise ObligationNotFoundException(category.value, reference_id)
+        
+        return balance
         
     async def _get_obligation_description(
         self, category: AllocationCategory, reference_id: str
@@ -511,36 +489,41 @@ class InterimPaymentService:
             amount=str(amount)
         )
 
-        # TODO: Replace with actual Ledger_Postings creation
-        # In production, this would:
-        # 1. Create entry in Ledger_Postings table
-        # 2. Link to InterimPayment via payment_id
-        # 3. Record category, reference_id, amount
-        # 4. Return posting reference ID
+        # === Map Interim Payment category to ledger category ===
+        category_mapping = {
+            AllocationCategory.LEASE: LedgerCat.LEASE,
+            AllocationCategory.REPAIR: LedgerCat.REPAIR,
+            AllocationCategory.LOAN: LedgerCat.LOAN,
+            AllocationCategory.EZPASS: LedgerCat.EZPASS,
+            AllocationCategory.PVB: LedgerCat.PVB,
+            AllocationCategory.MISC: LedgerCat.MISC,
+        }
+
+        ledger_category = category_mapping.get(category, LedgerCat.MISC)
+
+        # === User LedgerService to apply payment ===
+        ledger_service = LedgerService(self.repo.db)
+
+        # === Get balance_id for this reference ===
+        balance = await ledger_service.repo.get_balance_by_reference(
+            reference_id=reference_id,
+            reference_type=category.value
+        )
+
+        if not balance:
+            raise ObligationNotFoundException(category.value, reference_id)
         
-        # Placeholder logic
-        posting_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-        ledger_ref = f"IMP-POST-{posting_timestamp}-{allocation.id}"
-        
-        # Actual implementation would be:
-        # from app.ledger.models import LedgerPosting
-        # posting = LedgerPosting(
-        #     posting_date=datetime.now(timezone.utc),
-        #     category=category.value,
-        #     reference_id=reference_id,
-        #     payment_type="InterimPayment",
-        #     payment_id=allocation.payment_id,
-        #     amount=amount,
-        #     transaction_type="Credit",  # Credit reduces obligation
-        #     description=allocation.description
-        # )
-        # self.repo.db.add(posting)
-        # await self.repo.db.flush()
-        # await self.repo.db.refresh(posting)
-        # ledger_ref = posting.posting_id
-        
-        logger.info("Ledger posting created", ledger_ref=ledger_ref)
-        return ledger_ref
+        # === Apply Payment ===
+        posting, updated_balance = await ledger_service.apply_payment_to_balance(
+            balance_id=balance.balance_id,
+            payment_amount=amount,
+            payment_source="INTERIM_PAYMENT",
+            payment_source_id=str(allocation.payment_id),
+            created_by=allocation.created_by
+        )
+
+        logger.info("Ledger posting created", ledger_ref=posting.posting_id)
+        return posting.posting_id
     
     async def _update_obligation_balance(
         self,
