@@ -10,7 +10,6 @@ from sqlalchemy.orm import relationship
 # Local imports
 from app.core.db import Base
 from app.users.models import AuditMixin
-from app.ledger.models import DailyReceipt
 
 
 class MedallionStorage(Base, AuditMixin):
@@ -291,7 +290,6 @@ class Medallion(Base, AuditMixin):
         back_populates="medallion",
     )
 
-    daily_receipts = relationship("DailyReceipt", back_populates="medallion")
     ledger_entries = relationship("LedgerEntry", back_populates="medallion")
 
     def to_dict(self):

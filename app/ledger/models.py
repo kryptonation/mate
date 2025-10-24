@@ -1,137 +1,365 @@
-### app/ledger/models.py
+# app/ledger/models.py
 
-# Third party imports
+"""
+Centralized ledger models - SQLAlchemy 2.x
+
+Implements the dual-table ledger system:
+- Ledger_Postings: Immutable audit trail of all transactions.
+- Ledger_Balances: Rolling outstanding balances per obligation.
+"""
+
+from datetime import datetime
+from decimal import Decimal
+from typing import Optional
+from enum import Enum as PyEnum
+
 from sqlalchemy import (
-    Column, Integer, String, Enum, Numeric, Boolean, ForeignKey,
-    Float, DateTime , Date , Time
+    String, Numeric, DateTime, Date, Index, ForeignKey,
+    Enum as SQLEnum, Text
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-# Local imports
 from app.core.db import Base
 from app.users.models import AuditMixin
-from app.ledger.schemas import LedgerSourceType, DTRStatus
-from app.utils.s3_utils import s3_utils
-from app.utils.general import generate_alphanumeric_code
 
 
-class LedgerEntry(Base, AuditMixin):
-    """Leger entry model"""
-    __tablename__ = "ledger_entries"
+# === Enums ===
 
-    id = Column(Integer, primary_key=True, index=True)
-    driver_id = Column(Integer,ForeignKey("drivers.id"), nullable=True)
-    medallion_id = Column(Integer,ForeignKey("medallions.id"),nullable=True)
-    vehicle_id = Column(Integer,ForeignKey("vehicles.id"),nullable=True)
+class LedgerCategory(str, PyEnum):
+    """Obligation/earning categories in the ledger."""
+    LEASE = "Lease"
+    REPAIR = "Repair"
+    LOAN = "Loan"
+    EZPASS = "EZPass"
+    PVB = "PVB"
+    TLC = "TLC"
+    TAXES = "Taxes"
+    MISC = "Misc"
+    EARNINGS = "Earnings"
+    INTERIM_PAYMENT = "InterimPayment"
+    DEPOSIT = "Deposit"
 
-    amount = Column(Numeric(10, 2), nullable=True)
-    debit = Column(Boolean, default=False)
-    description = Column(String(255), nullable=True)
-    receipt_number = Column(String(255), nullable=True)
-    transaction_date = Column(Date, nullable=True)
-    transaction_time = Column(Time, nullable=True)
 
-    source_type = Column(Enum(LedgerSourceType),nullable=True)
-    source_id = Column(Integer, nullable=True)
-    ledger_id = Column(String(255) , nullable=True)
-    driver = relationship("Driver", back_populates="ledger_entries")
-    medallion = relationship("Medallion", back_populates="ledger_entries")
-    vehicle = relationship("Vehicle", back_populates="ledger_entries")
+class LedgerEntryType(str, PyEnum):
+    """Entry type for double-entry bookkeeping."""
+    DEBIT = "Debit"
+    CREDIT = "Credit"
 
-    def to_dict(self):
-        """Convert the LedgerEntry model to a dictionary"""
-        return {
-            "id": self.id,
-            "driver_id": self.driver_id,
-            "medallion_id": self.medallion_id,
-            "vehicle_id": self.vehicle_id,
-            "amount": self.amount,
-            "debit": self.debit,
-            "description": self.description,
-            "receipt_number": self.receipt_number,
-            "transaction_date": self.transaction_date,
-            "transaction_time": self.transaction_time,
-            "source_type": self.source_type,
-            "source_id": self.source_id,
-            "ledger_id": self.ledger_id,
-            "medallion": self.medallion.to_dict() if self.medallion else None,
-            "vehicle": self.vehicle.to_dict() if self.vehicle else None,
-            "driver": self.driver.to_dict() if self.driver else None,
-            "created_on": self.created_on,
-            "updated_on": self.updated_on
-        }
 
-class DailyReceipt(Base, AuditMixin):
-    """Daily Receipt Model"""
-    __tablename__ = "daily_receipts"
+class LedgerStatus(str, PyEnum):
+    """Status of ledger entries"""
+    POSTED = "Posted"
+    VOIDED = "Voided"
 
-    id = Column(Integer, primary_key=True, index=True)
-    driver_id = Column(Integer, ForeignKey("drivers.id"), nullable=False)
-    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), nullable=False)
-    medallion_id = Column(Integer, ForeignKey("medallions.id"), nullable=False)
-    lease_id = Column(Integer, ForeignKey("leases.id"), nullable=False)
-    receipt_number = Column(String(255), nullable=False)
-    period_start = Column(DateTime, nullable=False)
-    period_end = Column(DateTime, nullable=False)
 
-    cc_earnings = Column(Float)
-    cash_earnings = Column(Float)
-    tips = Column(Float)
-    lease_due = Column(Float)
-    ezpass_due = Column(Float)
-    pvb_due = Column(Float)
-    curb_due = Column(Float)
-    manual_fee = Column(Float)
-    incentives = Column(Float)
-    cash_paid = Column(Float)
+class BalanceStatus(str, PyEnum):
+    """Status of ledger balances"""
+    OPEN = "Open"
+    CLOSED = "Closed"
 
-    balance = Column(Float)
-    status = Column(Enum(DTRStatus), default=DTRStatus.DRAFT)
 
-    ledger_snapshot_id = Column(Integer, nullable=True)
-    receipt_html_key = Column(String(255), nullable=True)
-    receipt_pdf_key = Column(String(255), nullable=True)
-    receipt_excel_key = Column(String(255), nullable=True)
+# === Ledger_Postings Model ===
 
-    driver = relationship("Driver", back_populates="daily_receipts")
-    vehicle = relationship("Vehicle", back_populates="daily_receipts")
-    medallion = relationship("Medallion", back_populates="daily_receipts")
-    lease = relationship("Lease", back_populates="daily_receipts")
+class LedgerPosting(Base, AuditMixin):
+    """
+    Immutable record of every financial transaction.
 
-    @property
-    def receipt_html_url(self):
-        """Get the receipt presigned URL"""
-        if self.receipt_html_key:
-            return s3_utils.generate_presigned_url(self.receipt_html_key)
-        return None
+    Core Principles:
+    - One posting per event (earnings, obligations, payments, reversals)
+    - Never edited or deleted after creation
+    - Corrections via reversal entries
+    - Full audit trail of all financial activity
+
+    Every posting updates corresponding Ledger_Balances in real-time.
+    """
+    __tablename__ = "ledger_postings"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    posting_id: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, index=True,
+        comment="Unique posting identifier (e.g., POST-20251021-001234)"
+    )
+
+    # === Category and Classification ===
+    category: Mapped[str] = mapped_column(
+        SQLEnum(
+            "Lease", "Repair", "Loan", "EZPass", "PVB", "TLC",
+            "Taxes", "Misc", "Earnings", "InterimPayment", "Deposit",
+            name="ledger_category_enum"
+        ),
+        nullable=False, index=True, comment="Obligation or earning type"
+    )
+
+    # === Double entry fields ===
+    entry_type: Mapped[str] = mapped_column(
+        SQLEnum("Debit", "Credit", name="ledger_entry_type_enum"),
+        nullable=False, comment="DEBIT = obligation, CREDIT = earning/payment"
+    )
+
+    amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), nullable=False,
+        comment="Dollar value (always positive; entry_type determines debit/credit)"
+    )
+
+    # === Entity Linkage (Multi-Entity Support) ===
+    driver_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("drivers.id", ondelete="CASCADE"),
+        nullable=True, index=True, comment="Driver reference"
+    )
+
+    vehicle_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("vehicles.id", ondelete="SET NULL"),
+        nullable=True, index=True, comment="Vehicle reference"
+    )
+
+    vin: Mapped[Optional[str]] = mapped_column(
+        String(17), nullable=True, index=True,
+        comment="Vehicle VIN for filtering/reconciliation"
+    )
+
+    plate: Mapped[Optional[str]] = mapped_column(
+        String(16), nullable=True, index=True,
+        comment="Vehicle plate for filtering/reconciliation"
+    )
+
+    medallion_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("medallions.id", ondelete="SET NULL"),
+        nullable=True, index=True, comment="Medallion reference"
+    )
+
+    lease_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("leases.id", ondelete="SET NULL"),
+        nullable=True, index=True, comment="Lease reference"
+    )
+
+    # === Source Traceability ===
+    reference_id: Mapped[str] = mapped_column(
+        String(128), nullable=False, index=True,
+        comment="Source record ID (Lease ID, Repair Invoice ID, Loan ID, Trip ID, etc.)"
+    )
+
+    reference_type: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True,
+        comment="Type of source record for clarity"
+    )
+
+    # === Status and Lifecycle ===
+    status: Mapped[str] = mapped_column(
+        SQLEnum("Posted", "Voided", name="ledger_status_enum"),
+        default="Posted", nullable=False, index=True,
+        comment="POSTED = active, VOIDED = neutralized by reversal"
+    )
+
+    voided_by_posting_id: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True,
+        comment="Posting ID that voided this entry"
+    )
+
+    # === Posting Metadata ===
+    posted_on: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, index=True,
+        comment="Timestamp when entry was posted"
+    )
+
+    transaction_date: Mapped[Optional[Date]] = mapped_column(
+        Date, nullable=True, index=True,
+        comment="Business date of the transaction"
+    )
+
+    description: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Human-readable description"
+    )
+
+    # === Relationships ===
+    driver: Mapped[Optional["Driver"]] = relationship(
+        "Driver", lazy="select"
+    )
+    vehicle: Mapped[Optional["Vehicle"]] = relationship(
+        "Vehicle", lazy="select"
+    )
+    medallion: Mapped[Optional["Medallion"]] = relationship(
+        "Medallion", lazy="select"
+    )
+    lease: Mapped[Optional["Lease"]] = relationship(
+        "Lease", lazy="select"
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<LedgerPosting(id={self.id}, posting_id='{self.posting_id}', "
+            f"category='{self.category}', entry_type='{self.entry_type}', "
+            f"amount={self.amount})>"
+        )
     
-    @property
-    def receipt_pdf_url(self):
-        """Get the receipt PDF presigned URL"""
-        if self.receipt_pdf_key:
-            return s3_utils.generate_presigned_url(self.receipt_pdf_key)
-        return None
+    # Indexes for query optimization
+    __table_args__ = (
+        Index("idx_posting_category_driver", "category", "driver_id"),
+        Index("idx_posting_driver_date", "driver_id", "transaction_date"),
+        Index("idx_posting_reference", "reference_type", "reference_id"),
+        Index("idx_posting_status_date", "status", "posted_on"),
+    )
+
+
+# === Ledger_Balances Model ===
+
+class LedgerBalance(Base, AuditMixin):
+    """
+    Rolling snapshot of each obligation until cleared
+
+    Core Principles:
+    - One balance line per obligation (Reference_ID)
+    - Updated by Ledger_Postings (never manually)
+    - Remains OPEN until fully settled
+    - Marked CLOSED when Balance = 0 (retained for audit)
+    - Tracks payment history via Applied_Payment_Refs
+    """
+    __tablename__ = "ledger_balances"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    balance_id: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, index=True,
+        comment="Unique balance identifier (e.g., BAL-RPR-20251021-001234)"
+    )
+
+    # === Category and Classification ===
+    category: Mapped[str] = mapped_column(
+        SQLEnum(
+            "Lease", "Repair", "Loan", "EZPass", "PVB", "TLC",
+            "Taxes", "Misc", "Deposit", name="balance_category_enum"
+        ),
+        nullable=False, index=True, comment="Obligation type (no Earnings in balances)"
+    )
+
+    # === Entity Linkage ===
+    driver_id: Mapped[int] = mapped_column(
+        ForeignKey("drivers.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+        comment="Driver reference (required)"
+    )
+
+    vehicle_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("vehicles.id", ondelete="SET NULL"),
+        nullable=True, index=True, comment="Vehicle reference"
+    )
+
+    vin: Mapped[Optional[str]] = mapped_column(
+        String(18), nullable=True, index=True,
+        comment="Vehicle VIN"
+    )
+
+    plate: Mapped[Optional[str]] = mapped_column(
+        String(16), nullable=True, index=True,
+        comment="Vehicle plate"
+    )
+
+    medallion_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("medallions.id", ondelete="SET NULL"),
+        nullable=True, index=True, comment="Medallion reference"
+    )
+
+    lease_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("leases.id", ondelete="SET NULL"),
+        nullable=True, index=True, comment="Lease reference"
+    )
+
+    # === Source Traceability ===
+    reference_id: Mapped[str] = mapped_column(
+        String(128), nullable=False, index=True,
+        comment="Source obligation (Repair Invoice ID, Loan ID, Toll ID, Ticket ID, etc.)"
+    )
+
+    reference_type: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True,
+        comment="Type of source for clarity"
+    )
+
+    # === Balance Tracking ===
+    original_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), nullable=False,
+        comment="Total obligation from source (immutable)"
+    )
+
+    prior_balance: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), default=Decimal("0.00"), nullable=False,
+        comment="Carried over unpaid portion from previous cycle(s)"
+    )
+
+    payment: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), default=Decimal("0.00"), nullable=False,
+        comment="Amount settled this cycle"
+    )
+
+    balance: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), nullable=False, index=True,
+        comment="Remaining unpaid portion (updated after each payment/allocation)"
+    )
+
+    # === Payment References ===
+    applied_payment_refs: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="JSON array of payment IDs applied (Interim Payment ID, Earnings Batch ID)"
+    )
+
+    # === Status and Lifecycle ===
+    status: Mapped[str] = mapped_column(
+        SQLEnum("Open", "Closed", name="balance_status_enum"),
+        default="Open", nullable=False, index=True,
+        comment="OPEN = unpaid, CLOSED = fully settled (Balance = 0)"
+    )
+
+    # === Dates ===
+    obligation_date: Mapped[Optional[Date]] = mapped_column(
+        Date, nullable=True, index=True,
+        comment="Date obligation was created"
+    )
+
+    due_date: Mapped[Optional[Date]] = mapped_column(
+        Date, nullable=True, index=True,
+        comment="Due date for payment"
+    )
+
+    closed_on: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True,
+        comment="When balance was fully settled"
+    )
+
+    updated_on: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, index=True,
+        comment="Timestamp of last update"
+    )
+
+    description: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Human-readable description"
+    )
+
+    # === Relationships ===
+    driver: Mapped["Driver"] = relationship(
+        "Driver", lazy="select"
+    )
+    vehicle: Mapped[Optional["Vehicle"]] = relationship(
+        "Vehicle", lazy="select"
+    )
+    medallion: Mapped[Optional["Medallion"]] = relationship(
+        "Medallion", lazy="select"
+    )
+    lease: Mapped[Optional["Lease"]] = relationship(
+        "Lease", lazy="select"
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<LedgerBalance(id={self.id}, balance_id='{self.balance_id}', "
+            f"category='{self.category}', balance={self.balance}, "
+            f"status='{self.status}')>"
+        )
     
-    @property
-    def receipt_excel_url(self):
-        """Get the receipt Excel presigned URL"""
-        if self.receipt_excel_key:
-            return s3_utils.generate_presigned_url(self.receipt_excel_key)
-        return None
-    
-
-class ReportLog(Base, AuditMixin):
-    """Report Log Model"""
-    __tablename__ = "report_logs"
-
-    id = Column(Integer, primary_key=True, index=True)
-    report_type = Column(String(50), nullable=False)
-    filename = Column(String(255), nullable=False)
-    file_key = Column(String(255), nullable=False)
-    status = Column(String(54), default="PENDING")
-    is_autormated = Column(Boolean, default=False)
-    error_message = Column(String(255), nullable=True)
-    generated_at = Column(DateTime, nullable=True)
-
-    def __repr__(self):
-        return f"<ReportLog(id={self.id}, report_type={self.report_type}, status={self.status})>"
+    # Indexes for query optimization
+    __table_args__ = (
+        Index("idx_balance_category_driver", "category", "driver_id"),
+        Index("idx_balance_driver_status", "driver_id", "status"),
+        Index("idx_balance_reference", "reference_type", "reference_id"),
+        Index("idx_balance_status_date", "status", "obligation_date"),
+        Index("idx_balance_driver_category_status", "driver_id", "category", "status"),
+    )

@@ -16,7 +16,6 @@ from sqlalchemy.orm import relationship
 
 # Local imports
 from app.core.db import Base
-from app.ledger.models import DailyReceipt
 from app.users.models import AuditMixin
 from app.utils.general import generate_random_6_digit
 from app.vehicles.schemas import VehicleEntityStatus
@@ -505,7 +504,6 @@ class Vehicle(Base, AuditMixin):
 
     repairs = relationship("VehicleRepair", back_populates="vehicle")
 
-    daily_receipts = relationship("DailyReceipt", back_populates="vehicle")
     ledger_entries = relationship("LedgerEntry", back_populates="vehicle")
 
     def to_dict(self):
